@@ -1,0 +1,79 @@
+### Ping
+GET http://localhost:3001/ping
+
+### (вставь access token)
+@token = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjEsImxvZ2luIjoiY2F0X2N1bHRpdmF0b3JfMSIsImlhdCI6MTc3MDc1MTc3MSwiZXhwIjoxNzcwODM4MTcxfQ.e0lNKccVZAaEggTYQ9N5VePU1-SEuG_Fe9YAz1aFSiw
+### Global: send
+POST http://localhost:3001/chat/global/send
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "body": "Привет из глобального!"
+}
+
+### Global: history
+GET http://localhost:3001/chat/global/history?limit=100
+Authorization: Bearer {{token}}
+
+### Search users by nickname prefix
+GET http://localhost:3001/users/search?nickname=Кот-1&limit=20
+Authorization: Bearer {{token}}
+
+
+### DM: start
+POST http://localhost:3001/chat/dm/start
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "contact_user_id": 1
+}
+
+### DM: history
+GET http://localhost:3001/chat/dm/d911e582-2958-4d50-ad83-3712355038b4/history?limit=50
+Authorization: Bearer {{token}}
+
+### DM: send
+POST http://localhost:3001/chat/dm/d911e582-2958-4d50-ad83-3712355038b4/send
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "body": "Привет в личку!"
+}
+
+### Contacts
+GET http://localhost:3001/chat/contacts
+Authorization: Bearer {{token}}
+
+### Mail: inbox
+GET http://localhost:3001/mail/inbox?limit=50
+Authorization: Bearer {{token}}
+
+
+### Mail: open full mail (subject + body + reward_json)
+GET http://localhost:3001/mail/901e0915-c039-4b0f-87c3-da19dffc303d
+Authorization: Bearer {{token}}
+
+
+### Mail: read (auto-read in GET /mail/:id too)
+POST http://localhost:3001/mail/0bc11ecb-a385-4d50-b500-c0cb18f1f4fc/read
+Authorization: Bearer {{token}}
+
+### Mail: claim (optional Idempotency-Key)
+POST http://localhost:3001/mail/0bc11ecb-a385-4d50-b500-c0cb18f1f4fc/claim
+Authorization: Bearer {{token}}
+Idempotency-Key: 0a6f1a1c-0a0c-4eaa-9a7a-9f3bdc8c2f30
+
+### Admin: send mail (x-admin-key)
+POST http://localhost:3001/admin/mail/send
+Content-Type: application/json
+x-admin-key: YOUR_ADMIN_SECRET_KEY
+
+{
+  "to_user_id": 2,
+  "subject": "Награда за вход",
+  "body": "Держи деньги!",
+  "reward_json": { "money_mortals": 1000 }
+}

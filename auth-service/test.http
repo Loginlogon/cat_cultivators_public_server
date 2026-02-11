@@ -1,0 +1,53 @@
+# --- CONFIG ---
+@baseUrl = http://localhost:3000
+
+### 0) Ping
+GET {{baseUrl}}/ping
+
+### 1) Проверить логин (доступность)
+POST {{baseUrl}}/user/check-login
+Content-Type: application/json
+
+{
+  "login": "cat_cultivator_1"
+}
+
+### 2) Регистрация нового кота-культиватора
+POST {{baseUrl}}/register
+Content-Type: application/json
+
+{
+  "login": "cat_cultivator_1",
+  "nickname": "Кот-1",
+  "password": "paws_password_123"
+}
+
+### 3) Логин -> получаем access_token
+# @name login
+POST {{baseUrl}}/login
+Content-Type: application/json
+
+{
+  "login": "cat_cultivator_1",
+  "password": "paws_password_123"
+}
+
+### 4) Достаём токен из ответа логина (JSONPath)
+@authToken = {{login.response.body.$.access_token}}
+
+### 5) Получить статы (авторизация)
+GET {{baseUrl}}/cat-stats
+Authorization: Bearer {{authToken}}
+
+### 6) Дата регистрации по логину
+GET {{baseUrl}}/user/reg-date/cat_cultivator_1
+
+### 7) Refresh (обновить access_token)
+@refreshToken = {{login.response.body.$.refresh_token}}
+
+POST {{baseUrl}}/refresh
+Content-Type: application/json
+
+{
+  "refresh_token": "{{refreshToken}}"
+}
