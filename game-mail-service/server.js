@@ -1,6 +1,16 @@
 /**
  * game-mail-service/server.js
- * npm i ioredis pg-listen
+ *
+ * Требует:
+ *   npm i ioredis pg-listen
+ *
+ * ENV:
+ *   DATABASE_URL
+ *   ACCESS_SECRET
+ *   ADMIN_SECRET_KEY
+ *   REDIS_URL (optional, default redis://localhost:6379)
+ *   PORT (optional, default 3001)
+ *   PRESENCE_TTL_SEC (optional, default 15)
  */
 
 const express = require("express");
@@ -27,9 +37,17 @@ try {
 }
 
 const pool = new Pool({ connectionString: DATABASE_URL });
-const redis = new Redis(REDIS_URL);
+
+// Redis (presence)
+const redis = new Redis(REDIS_URL, {
+  enableAutoPipelining: false,
+  lazyConnect: true,
+});
+redis.on("error", (e) => console.error("❌ Redis error:", e?.message || e));
 
 // -------------------- HELPERS --------------------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 const clampInt = (v, def, min, max) => {
   const n = Number.isFinite(Number(v)) ? Number(v) : def;
   return Math.max(min, Math.min(max, Math.trunc(n)));
@@ -56,117 +74,219 @@ const authenticateToken = (req, res, next) => {
 };
 
 async function getUserBasic(userId) {
-  const r = await pool.query(
-    "SELECT id, login, nickname FROM users WHERE id = $1 LIMIT 1",
-    [userId]
-  );
+  const r = await pool.query("SELECT id, login, nickname FROM users WHERE id = $1 LIMIT 1", [userId]);
   return r.rows[0] || null;
 }
 
-// -------------------- DB INIT --------------------
-async function initDb() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS global_messages (
-        id BIGSERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        nickname TEXT NOT NULL,
-        body TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+// -------------------- DB: triggers for NOTIFY --------------------
+async function ensureNotifyTriggers(client) {
+  // Functions
+  await client.query(`
+    CREATE OR REPLACE FUNCTION notify_global_message() RETURNS trigger AS $$
+    BEGIN
+      PERFORM pg_notify(
+        'global_messages',
+        json_build_object(
+          'id', NEW.id,
+          'user_id', NEW.user_id,
+          'nickname', NEW.nickname,
+          'created_at', NEW.created_at
+        )::text
       );
-      CREATE INDEX IF NOT EXISTS idx_global_messages_id_desc ON global_messages(id DESC);
-    `);
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
 
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS conversations (
-        id UUID PRIMARY KEY,
-        type TEXT NOT NULL CHECK (type IN ('dm')),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  await client.query(`
+    CREATE OR REPLACE FUNCTION notify_dm_message() RETURNS trigger AS $$
+    BEGIN
+      PERFORM pg_notify(
+        'dm_messages',
+        json_build_object(
+          'id', NEW.id,
+          'conversation_id', NEW.conversation_id,
+          'sender_user_id', NEW.sender_user_id,
+          'sender_nickname', NEW.sender_nickname,
+          'created_at', NEW.created_at
+        )::text
       );
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
 
-      CREATE TABLE IF NOT EXISTS dm_pairs (
-        user_low INTEGER NOT NULL,
-        user_high INTEGER NOT NULL,
-        conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (user_low, user_high)
-      );
+  // Triggers (recreate safely)
+  await client.query(`DROP TRIGGER IF EXISTS trg_notify_global_message ON global_messages;`);
+  await client.query(`
+    CREATE TRIGGER trg_notify_global_message
+    AFTER INSERT ON global_messages
+    FOR EACH ROW EXECUTE FUNCTION notify_global_message();
+  `);
 
-      CREATE TABLE IF NOT EXISTS dm_messages (
-        id BIGSERIAL PRIMARY KEY,
-        conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        sender_user_id INTEGER NOT NULL,
-        sender_nickname TEXT NOT NULL,
-        body TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE INDEX IF NOT EXISTS idx_dm_messages_conv_id_desc ON dm_messages(conversation_id, id DESC);
+  await client.query(`DROP TRIGGER IF EXISTS trg_notify_dm_message ON dm_messages;`);
+  await client.query(`
+    CREATE TRIGGER trg_notify_dm_message
+    AFTER INSERT ON dm_messages
+    FOR EACH ROW EXECUTE FUNCTION notify_dm_message();
+  `);
+}
 
-      CREATE TABLE IF NOT EXISTS dm_contacts (
-        owner_user_id INTEGER NOT NULL,
-        contact_user_id INTEGER NOT NULL,
-        conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        last_message_id BIGINT,
-        last_at TIMESTAMP,
-        last_read_message_id BIGINT,
-        PRIMARY KEY (owner_user_id, contact_user_id)
-      );
-      CREATE INDEX IF NOT EXISTS idx_dm_contacts_owner_last_at ON dm_contacts(owner_user_id, last_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_dm_contacts_owner_unread ON dm_contacts(owner_user_id, last_message_id, last_read_message_id);
-    `);
+// -------------------- DB INIT + "soft migrations" --------------------
+let subscriberStarted = false;
 
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS mails (
-        id UUID PRIMARY KEY,
-        to_user_id INTEGER NOT NULL,
-        from_type TEXT NOT NULL CHECK (from_type IN ('system','admin','player')),
-        from_user_id INTEGER,
-        subject TEXT NOT NULL,
-        body TEXT NOT NULL,
-        reward_json JSONB,
-        status TEXT NOT NULL DEFAULT 'unread' CHECK (status IN ('unread','read','claimed')),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE INDEX IF NOT EXISTS idx_mails_to_created_desc ON mails(to_user_id, created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_mails_to_status_created_desc ON mails(to_user_id, status, created_at DESC);
-    `);
+async function initDbForever() {
+  while (true) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
 
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS global_reads (
-        user_id INTEGER PRIMARY KEY,
-        last_read_id BIGINT NOT NULL DEFAULT 0,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
+      // chat tables
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS global_messages (
+          id BIGSERIAL PRIMARY KEY,
+          user_id INTEGER NOT NULL,
+          nickname TEXT NOT NULL,
+          body TEXT NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_global_messages_id_desc ON global_messages(id DESC);`);
 
-    console.log("✅ game-mail-service: DB initialized");
-  } catch (err) {
-    console.error("❌ DB init error:", err?.message || err, "Retrying in 5s...");
-    setTimeout(initDb, 5000);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS conversations (
+          id UUID PRIMARY KEY,
+          type TEXT NOT NULL CHECK (type IN ('dm')),
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS dm_pairs (
+          user_low INTEGER NOT NULL,
+          user_high INTEGER NOT NULL,
+          conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (user_low, user_high)
+        );
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS dm_messages (
+          id BIGSERIAL PRIMARY KEY,
+          conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+          sender_user_id INTEGER NOT NULL,
+          sender_nickname TEXT NOT NULL,
+          body TEXT NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_messages_conv_id_desc ON dm_messages(conversation_id, id DESC);`);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS dm_contacts (
+          owner_user_id INTEGER NOT NULL,
+          contact_user_id INTEGER NOT NULL,
+          conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+          last_message_id BIGINT,
+          last_at TIMESTAMP,
+          PRIMARY KEY (owner_user_id, contact_user_id)
+        );
+      `);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_contacts_owner_last_at ON dm_contacts(owner_user_id, last_at DESC);`);
+
+      // ---- migrations for existing installs ----
+      await client.query(`ALTER TABLE dm_contacts ADD COLUMN IF NOT EXISTS last_read_message_id BIGINT;`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_contacts_owner_unread ON dm_contacts(owner_user_id, last_message_id, last_read_message_id);`);
+
+      // mails table
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS mails (
+          id UUID PRIMARY KEY,
+          to_user_id INTEGER NOT NULL,
+          from_type TEXT NOT NULL CHECK (from_type IN ('system','admin','player')),
+          from_user_id INTEGER,
+          subject TEXT NOT NULL,
+          body TEXT NOT NULL,
+          reward_json JSONB,
+          status TEXT NOT NULL DEFAULT 'unread' CHECK (status IN ('unread','read','claimed')),
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_mails_to_created_desc ON mails(to_user_id, created_at DESC);`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_mails_to_status_created_desc ON mails(to_user_id, status, created_at DESC);`);
+
+      // global reads (unread counter)
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS global_reads (
+          user_id INTEGER PRIMARY KEY,
+          last_read_id BIGINT NOT NULL DEFAULT 0,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // ensure NOTIFY triggers
+      await ensureNotifyTriggers(client);
+
+      await client.query("COMMIT");
+
+      console.log("✅ game-mail-service: DB initialized (tables + migrations + triggers)");
+
+      // start subscriber only after DB is ready
+      if (!subscriberStarted) {
+        subscriberStarted = true;
+        startSubscriber().catch((e) => console.error("❌ subscriber start failed:", e?.message || e));
+      }
+
+      return;
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+      console.error("❌ DB init error:", err?.message || err, "Retrying in 5s...");
+      await sleep(5000);
+    } finally {
+      client.release();
+    }
   }
 }
-initDb();
 
 // -------------------- REDIS PRESENCE --------------------
-// TTL 15 секунд: если ключ протух — оффлайн
 const PRESENCE_TTL_SEC = Number(process.env.PRESENCE_TTL_SEC || 15);
 
 function presenceKey(uid) {
   return `online:${uid}`;
 }
 
+async function ensureRedisConnected() {
+  try {
+    if (redis.status === "ready") return;
+    if (redis.status === "connecting") return;
+    await redis.connect();
+  } catch (e) {
+    // Не валим сервис: presence просто не будет работать, а чаты/почта будут
+    console.error("❌ Redis connect failed:", e?.message || e);
+  }
+}
+
 async function touchPresence(uid) {
-  // SETEX key ttl "1"
+  await ensureRedisConnected();
+  if (redis.status !== "ready") return;
   await redis.set(presenceKey(uid), "1", "EX", PRESENCE_TTL_SEC);
 }
 
 async function isOnline(uid) {
+  await ensureRedisConnected();
+  if (redis.status !== "ready") return false;
   const v = await redis.get(presenceKey(uid));
   return v !== null;
 }
 
 async function onlineBatch(ids) {
-  const unique = Array.from(new Set(ids.map(Number).filter(x => Number.isInteger(x) && x > 0))).slice(0, 200);
+  await ensureRedisConnected();
+  if (redis.status !== "ready") return [];
+
+  const unique = Array.from(new Set(ids.map(Number).filter((x) => Number.isInteger(x) && x > 0))).slice(0, 200);
   if (!unique.length) return [];
 
   const pipe = redis.pipeline();
@@ -177,7 +297,6 @@ async function onlineBatch(ids) {
 
 // -------------------- SSE + Postgres LISTEN/NOTIFY --------------------
 const sseClients = new Map(); // userId -> Set<{res, scope}>
-
 function addSseClient(userId, res, scope) {
   const uid = Number(userId);
   if (!sseClients.has(uid)) sseClients.set(uid, new Set());
@@ -185,7 +304,6 @@ function addSseClient(userId, res, scope) {
   sseClients.get(uid).add(entry);
   return entry;
 }
-
 function removeSseClient(userId, entry) {
   const uid = Number(userId);
   const set = sseClients.get(uid);
@@ -193,17 +311,18 @@ function removeSseClient(userId, entry) {
   set.delete(entry);
   if (set.size === 0) sseClients.delete(uid);
 }
-
 function sseSend(res, event, obj) {
   const data = JSON.stringify(obj);
   res.write(`event: ${event}\n`);
   res.write(`data: ${data}\n\n`);
 }
-
 function safeJson(s) {
-  try { return JSON.parse(s); } catch (_) { return { raw: s }; }
+  try {
+    return JSON.parse(s);
+  } catch (_) {
+    return { raw: s };
+  }
 }
-
 function broadcastToUser(uid, event, payload, scopeFilterFn = null) {
   const set = sseClients.get(Number(uid));
   if (!set) return;
@@ -220,7 +339,6 @@ async function startSubscriber() {
   try {
     subscriber.notifications.on("global_messages", (payload) => {
       const obj = safeJson(payload);
-      // пушим всем, кто сейчас слушает global
       for (const [, set] of sseClients.entries()) {
         for (const entry of set) {
           if (entry.scope === "global") sseSend(entry.res, "global_message", obj);
@@ -233,10 +351,7 @@ async function startSubscriber() {
       const convId = obj?.conversation_id;
       if (!convId) return;
 
-      const r = await pool.query(
-        "SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1",
-        [convId]
-      );
+      const r = await pool.query("SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1", [convId]);
       if (!r.rows.length) return;
 
       const { user_low, user_high } = r.rows[0];
@@ -254,10 +369,10 @@ async function startSubscriber() {
     console.log("✅ LISTEN/NOTIFY subscriber started");
   } catch (e) {
     console.error("❌ Failed to start subscriber:", e?.message || e);
-    setTimeout(startSubscriber, 5000);
+    await sleep(5000);
+    return startSubscriber();
   }
 }
-startSubscriber();
 
 // SSE endpoint
 app.get("/events", authenticateToken, async (req, res) => {
@@ -268,7 +383,7 @@ app.get("/events", authenticateToken, async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  res.flushHeaders?.(); // важно для установления SSE :contentReference[oaicite:5]{index=5}
+  res.flushHeaders?.();
 
   await touchPresence(req.user.uid);
 
@@ -280,9 +395,7 @@ app.get("/events", authenticateToken, async (req, res) => {
     try {
       sseSend(res, "keepalive", { t: Date.now() });
       await touchPresence(req.user.uid);
-    } catch (_) {
-      // если клиент отвалился — close обработает
-    }
+    } catch (_) {}
   }, 10000);
 
   req.on("close", () => {
@@ -292,11 +405,11 @@ app.get("/events", authenticateToken, async (req, res) => {
 });
 
 // -------------------- BASIC ROUTES --------------------
-app.get("/ping", async (req, res) => {
+app.get("/ping", (req, res) => {
   res.json({ status: "ok", message: "pong", service: "game-mail-service", server_time: new Date().toISOString() });
 });
 
-// Presence endpoints
+// -------------------- Presence endpoints --------------------
 app.get("/presence/online/:userId", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -310,7 +423,7 @@ app.get("/presence/online/:userId", authenticateToken, async (req, res) => {
 app.get("/presence/online-batch", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
-  const ids = (req.query.ids || "").toString().split(",").map(x => Number(x.trim()));
+  const ids = (req.query.ids || "").toString().split(",").map((x) => Number(x.trim()));
   const online = await onlineBatch(ids);
   res.json({ online });
 });
@@ -321,7 +434,6 @@ app.get("/users/search", authenticateToken, async (req, res) => {
 
   const nickname = (req.query.nickname || "").toString().trim();
   const limit = clampInt(req.query.limit, 20, 1, 50);
-
   if (!nickname) return res.status(400).json({ error: "nickname query required" });
 
   try {
@@ -337,7 +449,7 @@ app.get("/users/search", authenticateToken, async (req, res) => {
     res.json({
       query: nickname,
       limit,
-      users: r.rows.map(u => ({ id: u.id, nickname: u.nickname, header: `${u.nickname}#${u.id}` }))
+      users: r.rows.map((u) => ({ id: u.id, nickname: u.nickname, header: `${u.nickname}#${u.id}` })),
     });
   } catch (e) {
     res.status(500).json({ error: "Database error" });
@@ -366,15 +478,11 @@ app.get("/chat/global/history", authenticateToken, async (req, res) => {
     const params = beforeId ? [beforeId, limit] : [limit];
     const r = await pool.query(q, params);
 
-    const items = r.rows.reverse().map(m => ({
+    const items = r.rows.reverse().map((m) => ({
       id: m.id,
       body: m.body,
       created_at: m.created_at,
-      sender: {
-        user_id: m.user_id,
-        nickname: m.nickname,
-        header: `${m.nickname}#${m.user_id}`
-      }
+      sender: { user_id: m.user_id, nickname: m.nickname, header: `${m.nickname}#${m.user_id}` },
     }));
 
     const next_before_id = items.length ? items[0].id : null;
@@ -402,6 +510,7 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
       [me.id, me.nickname, body]
     );
 
+    // keep last 100
     await pool.query(`
       DELETE FROM global_messages
       WHERE id NOT IN (
@@ -414,8 +523,8 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
       data: {
         id: insert.rows[0].id,
         created_at: insert.rows[0].created_at,
-        sender: { user_id: me.id, nickname: me.nickname, header: `${me.nickname}#${me.id}` }
-      }
+        sender: { user_id: me.id, nickname: me.nickname, header: `${me.nickname}#${me.id}` },
+      },
     });
   } catch (e) {
     res.status(500).json({ error: "Database error" });
@@ -551,15 +660,11 @@ app.get("/chat/dm/:conversation_id/history", authenticateToken, async (req, res)
     const params = beforeId ? [conversationId, beforeId, limit] : [conversationId, limit];
     const r = await pool.query(q, params);
 
-    const items = r.rows.reverse().map(m => ({
+    const items = r.rows.reverse().map((m) => ({
       id: m.id,
       body: m.body,
       created_at: m.created_at,
-      sender: {
-        user_id: m.sender_user_id,
-        nickname: m.sender_nickname,
-        header: `${m.sender_nickname}#${m.sender_user_id}`
-      }
+      sender: { user_id: m.sender_user_id, nickname: m.sender_nickname, header: `${m.sender_nickname}#${m.sender_user_id}` },
     }));
 
     const next_before_id = items.length ? items[0].id : null;
@@ -622,7 +727,9 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
       `INSERT INTO dm_contacts (owner_user_id, contact_user_id, conversation_id, last_message_id, last_at)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (owner_user_id, contact_user_id)
-       DO UPDATE SET last_message_id = EXCLUDED.last_message_id, last_at = EXCLUDED.last_at, conversation_id = EXCLUDED.conversation_id`,
+       DO UPDATE SET last_message_id = EXCLUDED.last_message_id,
+                     last_at = EXCLUDED.last_at,
+                     conversation_id = EXCLUDED.conversation_id`,
       [req.user.uid, otherId, conversationId, msgId, createdAt]
     );
 
@@ -630,7 +737,9 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
       `INSERT INTO dm_contacts (owner_user_id, contact_user_id, conversation_id, last_message_id, last_at)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (owner_user_id, contact_user_id)
-       DO UPDATE SET last_message_id = EXCLUDED.last_message_id, last_at = EXCLUDED.last_at, conversation_id = EXCLUDED.conversation_id`,
+       DO UPDATE SET last_message_id = EXCLUDED.last_message_id,
+                     last_at = EXCLUDED.last_at,
+                     conversation_id = EXCLUDED.conversation_id`,
       [otherId, req.user.uid, conversationId, msgId, createdAt]
     );
 
@@ -641,8 +750,8 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
       data: {
         id: msgId,
         created_at: createdAt,
-        sender: { user_id: req.user.uid, nickname: me.rows[0].nickname, header: `${me.rows[0].nickname}#${req.user.uid}` }
-      }
+        sender: { user_id: req.user.uid, nickname: me.rows[0].nickname, header: `${me.rows[0].nickname}#${req.user.uid}` },
+      },
     });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch (_) {}
@@ -652,7 +761,77 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
   }
 });
 
-// -------------------- NOTIFICATIONS SUMMARY (unread counts) --------------------
+// DM contacts list
+app.get("/chat/contacts", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
+  try {
+    const r = await pool.query(
+      `SELECT c.contact_user_id, c.conversation_id, c.last_message_id, c.last_read_message_id, c.last_at, u.nickname
+       FROM dm_contacts c
+       JOIN users u ON u.id = c.contact_user_id
+       WHERE c.owner_user_id = $1
+       ORDER BY c.last_at DESC NULLS LAST
+       LIMIT 200`,
+      [req.user.uid]
+    );
+
+    res.json({
+      contacts: r.rows.map((x) => ({
+        contact_user_id: x.contact_user_id,
+        nickname: x.nickname,
+        header: `${x.nickname}#${x.contact_user_id}`,
+        conversation_id: x.conversation_id,
+        last_message_id: x.last_message_id,
+        last_read_message_id: x.last_read_message_id,
+        last_at: x.last_at,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// отметить DM как прочитанный (до message_id)
+app.post("/chat/dm/:conversation_id/read", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
+  const conversationId = req.params.conversation_id;
+  const last_read_message_id = Number(req.body?.last_read_message_id);
+
+  if (!Number.isInteger(last_read_message_id) || last_read_message_id < 0) {
+    return res.status(400).json({ error: "last_read_message_id must be integer >= 0" });
+  }
+
+  try {
+    const pair = await pool.query(
+      `SELECT user_low, user_high
+       FROM dm_pairs
+       WHERE conversation_id = $1
+       LIMIT 1`,
+      [conversationId]
+    );
+    if (!pair.rows.length) return res.status(404).json({ error: "Conversation not found" });
+
+    const { user_low, user_high } = pair.rows[0];
+    if (req.user.uid !== user_low && req.user.uid !== user_high) return res.status(403).json({ error: "Not a member of this conversation" });
+
+    const otherId = req.user.uid === user_low ? user_high : user_low;
+
+    await pool.query(
+      `UPDATE dm_contacts
+       SET last_read_message_id = GREATEST(COALESCE(last_read_message_id, 0), $1)
+       WHERE owner_user_id = $2 AND contact_user_id = $3`,
+      [last_read_message_id, req.user.uid, otherId]
+    );
+
+    res.json({ ok: true, conversation_id: conversationId, last_read_message_id });
+  } catch (e) {
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// -------------------- NOTIFICATIONS SUMMARY --------------------
 app.get("/notifications/summary", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -665,30 +844,17 @@ app.get("/notifications/summary", authenticateToken, async (req, res) => {
       [req.user.uid]
     );
 
-    const gr = await pool.query(
-      `SELECT last_read_id FROM global_reads WHERE user_id = $1 LIMIT 1`,
-      [req.user.uid]
-    );
+    const gr = await pool.query(`SELECT last_read_id FROM global_reads WHERE user_id = $1 LIMIT 1`, [req.user.uid]);
     const lastRead = gr.rows.length ? Number(gr.rows[0].last_read_id) : 0;
 
-    const g = await pool.query(
-      `SELECT COUNT(*)::int AS cnt
-       FROM global_messages
-       WHERE id > $1`,
-      [lastRead]
-    );
+    const g = await pool.query(`SELECT COUNT(*)::int AS cnt FROM global_messages WHERE id > $1`, [lastRead]);
 
-    const m = await pool.query(
-      `SELECT COUNT(*)::int AS cnt
-       FROM mails
-       WHERE to_user_id = $1 AND status = 'unread'`,
-      [req.user.uid]
-    );
+    const m = await pool.query(`SELECT COUNT(*)::int AS cnt FROM mails WHERE to_user_id = $1 AND status = 'unread'`, [req.user.uid]);
 
     res.json({
       dm_unread: dm.rows[0].cnt,
       global_unread: g.rows[0].cnt,
-      mail_unread: m.rows[0].cnt
+      mail_unread: m.rows[0].cnt,
     });
   } catch (e) {
     res.status(500).json({ error: "Database error" });
@@ -753,10 +919,37 @@ app.get("/mail/:id", authenticateToken, async (req, res) => {
   }
 });
 
+app.post("/mail/:id/read", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
+  const id = req.params.id;
+
+  try {
+    const upd = await pool.query(
+      `UPDATE mails
+       SET status = 'read'
+       WHERE id = $1 AND to_user_id = $2 AND status = 'unread'
+       RETURNING id, status`,
+      [id, req.user.uid]
+    );
+
+    if (upd.rows.length === 0) {
+      const chk = await pool.query(`SELECT id, status FROM mails WHERE id = $1 AND to_user_id = $2 LIMIT 1`, [id, req.user.uid]);
+      if (chk.rows.length === 0) return res.status(404).json({ error: "Mail not found" });
+      return res.json({ mail: chk.rows[0] });
+    }
+
+    res.json({ mail: upd.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
 app.post("/mail/:id/claim", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
   const id = req.params.id;
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -794,12 +987,7 @@ app.post("/mail/:id/claim", authenticateToken, async (req, res) => {
       );
     }
 
-    await client.query(
-      `UPDATE mails
-       SET status = 'claimed'
-       WHERE id = $1 AND to_user_id = $2`,
-      [id, req.user.uid]
-    );
+    await client.query(`UPDATE mails SET status = 'claimed' WHERE id = $1 AND to_user_id = $2`, [id, req.user.uid]);
 
     await client.query("COMMIT");
     res.json({ status: "claimed", applied: { money_mortals: addMortals, money_cultivators: addCult } });
@@ -839,7 +1027,17 @@ app.post("/admin/mail/send", requireAdmin, async (req, res) => {
 });
 
 // -------------------- START --------------------
-app.listen(PORT, () => console.log(`🚀 game-mail-service on port ${PORT}`));
+async function main() {
+  // init DB (with retries)
+  await initDbForever();
+
+  app.listen(PORT, () => console.log(`🚀 game-mail-service on port ${PORT}`));
+}
+
+main().catch((e) => {
+  console.error("❌ fatal:", e?.message || e);
+  process.exit(1);
+});
 
 process.on("SIGINT", async () => {
   try { await subscriber.close(); } catch (_) {}
