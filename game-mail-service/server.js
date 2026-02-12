@@ -67,11 +67,15 @@ const authenticateToken = (req, res, next) => {
   if (!token) return res.status(401).json({ error: "Token missing" });
 
   jwt.verify(token, ACCESS_SECRET, (err, payload) => {
-    if (err) return res.status(403).json({ error: "Access token expired or invalid" });
+    if (err) {
+      // было 403 -> делаем 401, чтобы клиент мог авто-рефрешить токен
+      return res.status(401).json({ error: "Access token expired or invalid" });
+    }
     req.user = payload; // { uid, login }
     next();
   });
 };
+
 
 async function getUserBasic(userId) {
   const r = await pool.query("SELECT id, login, nickname FROM users WHERE id = $1 LIMIT 1", [userId]);
