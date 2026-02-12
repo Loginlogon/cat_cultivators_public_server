@@ -2,14 +2,14 @@
 GET http://localhost:3001/ping
 
 ### (вставь access token)
-@token = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjIsImxvZ2luIjoiY2F0X2N1bHRpdmF0b3JfMSIsImlhdCI6MTc3MDg5OTAwNSwiZXhwIjoxNzcwOTg1NDA1fQ.SwxiWqcAnW-K5MjBf2ViCTp0W7qvbbthJrQ7q1g-DGQ
+@token = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjIsImxvZ2luIjoiY2F0X2N1bHRpdmF0b3JfMSIsImlhdCI6MTc3MDkxNjg3NSwiZXhwIjoxNzcxMDAzMjc1fQ.r05fguBUcXM5qA5KYtM9WfTyB_ssVsoRrbvXHqNdySA
 ### Global: send
 POST http://localhost:3001/chat/global/send
 Authorization: Bearer {{token}}
 Content-Type: application/json
 
 {
-  "body": "Привет из глобального!3"
+  "body": "Привет из глобального!"
 }
 
 ### Global: history
@@ -35,12 +35,12 @@ GET http://localhost:3001/chat/dm/d911e582-2958-4d50-ad83-3712355038b4/history?l
 Authorization: Bearer {{token}}
 
 ### DM: send
-POST http://localhost:3001/chat/dm/56d7466e-b7cf-4b2e-b5c7-bdd3baa4a374/send
+POST http://localhost:3001/chat/dm/5c8cf57f-e3c3-436f-8cc9-b9defc4862d6/send
 Authorization: Bearer {{token}}
 Content-Type: application/json
 
 {
-  "body": "Привет в личку!7"
+  "body": "Привет в личку!8"
 }
 
 ### Contacts

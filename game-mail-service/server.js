@@ -1,18 +1,3 @@
-/**
- * game-mail-service/server.js
- *
- * Требует:
- *   npm i ioredis pg-listen
- *
- * ENV:
- *   DATABASE_URL
- *   ACCESS_SECRET
- *   ADMIN_SECRET_KEY
- *   REDIS_URL (optional, default redis://localhost:6379)
- *   PORT (optional, default 3001)
- *   PRESENCE_TTL_SEC (optional, default 15)
- */
-
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
@@ -68,14 +53,12 @@ const authenticateToken = (req, res, next) => {
 
   jwt.verify(token, ACCESS_SECRET, (err, payload) => {
     if (err) {
-      // было 403 -> делаем 401, чтобы клиент мог авто-рефрешить токен
       return res.status(401).json({ error: "Access token expired or invalid" });
     }
     req.user = payload; // { uid, login }
     next();
   });
 };
-
 
 async function getUserBasic(userId) {
   const r = await pool.query("SELECT id, login, nickname FROM users WHERE id = $1 LIMIT 1", [userId]);
@@ -84,7 +67,6 @@ async function getUserBasic(userId) {
 
 // -------------------- DB: triggers for NOTIFY --------------------
 async function ensureNotifyTriggers(client) {
-  // Functions
   await client.query(`
     CREATE OR REPLACE FUNCTION notify_global_message() RETURNS trigger AS $$
     BEGIN
@@ -120,7 +102,6 @@ async function ensureNotifyTriggers(client) {
     $$ LANGUAGE plpgsql;
   `);
 
-  // Triggers (recreate safely)
   await client.query(`DROP TRIGGER IF EXISTS trg_notify_global_message ON global_messages;`);
   await client.query(`
     CREATE TRIGGER trg_notify_global_message
@@ -145,7 +126,6 @@ async function initDbForever() {
     try {
       await client.query("BEGIN");
 
-      // chat tables
       await client.query(`
         CREATE TABLE IF NOT EXISTS global_messages (
           id BIGSERIAL PRIMARY KEY,
@@ -199,11 +179,9 @@ async function initDbForever() {
       `);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_contacts_owner_last_at ON dm_contacts(owner_user_id, last_at DESC);`);
 
-      // ---- migrations for existing installs ----
       await client.query(`ALTER TABLE dm_contacts ADD COLUMN IF NOT EXISTS last_read_message_id BIGINT;`);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_contacts_owner_unread ON dm_contacts(owner_user_id, last_message_id, last_read_message_id);`);
 
-      // mails table
       await client.query(`
         CREATE TABLE IF NOT EXISTS mails (
           id UUID PRIMARY KEY,
@@ -220,7 +198,6 @@ async function initDbForever() {
       await client.query(`CREATE INDEX IF NOT EXISTS idx_mails_to_created_desc ON mails(to_user_id, created_at DESC);`);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_mails_to_status_created_desc ON mails(to_user_id, status, created_at DESC);`);
 
-      // global reads (unread counter)
       await client.query(`
         CREATE TABLE IF NOT EXISTS global_reads (
           user_id INTEGER PRIMARY KEY,
@@ -229,14 +206,12 @@ async function initDbForever() {
         );
       `);
 
-      // ensure NOTIFY triggers
       await ensureNotifyTriggers(client);
 
       await client.query("COMMIT");
 
       console.log("✅ game-mail-service: DB initialized (tables + migrations + triggers)");
 
-      // start subscriber only after DB is ready
       if (!subscriberStarted) {
         subscriberStarted = true;
         startSubscriber().catch((e) => console.error("❌ subscriber start failed:", e?.message || e));
@@ -268,7 +243,6 @@ async function ensureRedisConnected() {
     if (redis.status === "connecting") return;
     await redis.connect();
   } catch (e) {
-    // Не валим сервис: presence просто не будет работать, а чаты/почта будут
     console.error("❌ Redis connect failed:", e?.message || e);
   }
 }
@@ -295,7 +269,7 @@ async function onlineBatch(ids) {
 
   const pipe = redis.pipeline();
   for (const id of unique) pipe.get(presenceKey(id));
-  const results = await pipe.exec(); // [[err, val], ...]
+  const results = await pipe.exec();
   return unique.map((id, idx) => ({ user_id: id, online: results[idx]?.[1] !== null }));
 }
 
@@ -350,18 +324,35 @@ async function startSubscriber() {
       }
     });
 
-    subscriber.notifications.on("dm_messages", async (payload) => {
-      const obj = safeJson(payload);
-      const convId = obj?.conversation_id;
-      if (!convId) return;
+    // ✅ FIX: safe dm handler (no async emitter callback + try/catch)
+    subscriber.notifications.on("dm_messages", (payload) => {
+      (async () => {
+        try {
+          const obj = safeJson(payload);
+          const convId = obj?.conversation_id;
+          if (!convId) return;
 
-      const r = await pool.query("SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1", [convId]);
-      if (!r.rows.length) return;
+          console.log("📩 NOTIFY dm_messages:", obj);
 
-      const { user_low, user_high } = r.rows[0];
+          const r = await pool.query(
+            "SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1",
+            [convId]
+          );
+          if (!r.rows.length) {
+            console.warn("⚠️ dm_pairs not found for conv:", convId);
+            return;
+          }
 
-      broadcastToUser(user_low, "dm_message", obj, (scope) => scope === "dm" || scope === `dm:${convId}`);
-      broadcastToUser(user_high, "dm_message", obj, (scope) => scope === "dm" || scope === `dm:${convId}`);
+          const { user_low, user_high } = r.rows[0];
+          console.log("➡️ broadcast dm_message to:", user_low, user_high, "conv:", convId);
+
+          broadcastToUser(user_low, "dm_message", obj, (scope) => scope === "dm" || scope === `dm:${convId}`);
+          broadcastToUser(user_high, "dm_message", obj, (scope) => scope === "dm" || scope === `dm:${convId}`);
+        } catch (e) {
+          // без этого ошибки превращаются в unhandled rejection и ломают реальный тайм
+          console.error("❌ dm_messages handler failed:", e?.message || e);
+        }
+      })();
     });
 
     subscriber.events.on("error", (err) => console.error("❌ pg-listen error:", err?.message || err));
@@ -382,11 +373,11 @@ async function startSubscriber() {
 app.get("/events", authenticateToken, async (req, res) => {
   const scope = (req.query.scope || "global").toString();
 
-  // SSE headers
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // полезно, если появится proxy/nginx
   res.flushHeaders?.();
 
   await touchPresence(req.user.uid);
@@ -394,7 +385,6 @@ app.get("/events", authenticateToken, async (req, res) => {
   const entry = addSseClient(req.user.uid, res, scope);
   sseSend(res, "hello", { ok: true, scope, server_time: new Date().toISOString() });
 
-  // keep-alive + presence heartbeat
   const ka = setInterval(async () => {
     try {
       sseSend(res, "keepalive", { t: Date.now() });
@@ -749,12 +739,29 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
 
     await client.query("COMMIT");
 
+    // ✅ PUSH DM EVENT IMMEDIATELY (без ожидания LISTEN/NOTIFY)
+    const ssePayload = {
+      id: msgId,
+      conversation_id: conversationId,
+      sender_user_id: req.user.uid,
+      sender_nickname: me.rows[0].nickname,
+      created_at: createdAt,
+    };
+
+    // обоим участникам (и тем кто слушает общий dm, и тем кто слушает конкретный dm:<convId>)
+    broadcastToUser(user_low, "dm_message", ssePayload, (scope) => scope === "dm" || scope === `dm:${conversationId}`);
+    broadcastToUser(user_high, "dm_message", ssePayload, (scope) => scope === "dm" || scope === `dm:${conversationId}`);
+
     res.status(201).json({
       message: "sent",
       data: {
         id: msgId,
         created_at: createdAt,
-        sender: { user_id: req.user.uid, nickname: me.rows[0].nickname, header: `${me.rows[0].nickname}#${req.user.uid}` },
+        sender: {
+          user_id: req.user.uid,
+          nickname: me.rows[0].nickname,
+          header: `${me.rows[0].nickname}#${req.user.uid}`,
+        },
       },
     });
   } catch (e) {
