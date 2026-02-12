@@ -1,17 +1,25 @@
+/**
+ * game-mail-service/server.js
+ * npm i ioredis pg-listen
+ */
+
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
 const { v4: uuidv4 } = require("uuid");
+const createSubscriber = require("pg-listen");
+const Redis = require("ioredis");
 const { readEnv } = require("./env");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-let ACCESS_SECRET, ADMIN_SECRET_KEY, DATABASE_URL, PORT;
+let ACCESS_SECRET, ADMIN_SECRET_KEY, DATABASE_URL, REDIS_URL, PORT;
 try {
   ACCESS_SECRET = readEnv("ACCESS_SECRET");
   ADMIN_SECRET_KEY = readEnv("ADMIN_SECRET_KEY");
   DATABASE_URL = readEnv("DATABASE_URL");
+  REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
   PORT = process.env.PORT || 3001;
 } catch (e) {
   console.error("❌", e.message);
@@ -19,11 +27,9 @@ try {
 }
 
 const pool = new Pool({ connectionString: DATABASE_URL });
+const redis = new Redis(REDIS_URL);
 
-// дальше твой код без изменений...
-
-
-// --- HELPERS ---
+// -------------------- HELPERS --------------------
 const clampInt = (v, def, min, max) => {
   const n = Number.isFinite(Number(v)) ? Number(v) : def;
   return Math.max(min, Math.min(max, Math.trunc(n)));
@@ -57,7 +63,7 @@ async function getUserBasic(userId) {
   return r.rows[0] || null;
 }
 
-// --- DB INIT ---
+// -------------------- DB INIT --------------------
 async function initDb() {
   try {
     await pool.query(`
@@ -102,9 +108,11 @@ async function initDb() {
         conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         last_message_id BIGINT,
         last_at TIMESTAMP,
+        last_read_message_id BIGINT,
         PRIMARY KEY (owner_user_id, contact_user_id)
       );
       CREATE INDEX IF NOT EXISTS idx_dm_contacts_owner_last_at ON dm_contacts(owner_user_id, last_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_dm_contacts_owner_unread ON dm_contacts(owner_user_id, last_message_id, last_read_message_id);
     `);
 
     await pool.query(`
@@ -123,37 +131,200 @@ async function initDb() {
       CREATE INDEX IF NOT EXISTS idx_mails_to_status_created_desc ON mails(to_user_id, status, created_at DESC);
     `);
 
-    // если таблица mail_claims осталась от старой версии — можно удалить вручную (см. ниже)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS global_reads (
+        user_id INTEGER PRIMARY KEY,
+        last_read_id BIGINT NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     console.log("✅ game-mail-service: DB initialized");
   } catch (err) {
     console.error("❌ DB init error:", err?.message || err, "Retrying in 5s...");
     setTimeout(initDb, 5000);
   }
 }
-
 initDb();
 
-// --- ROUTES ---
-app.get("/ping", (req, res) => {
+// -------------------- REDIS PRESENCE --------------------
+// TTL 15 секунд: если ключ протух — оффлайн
+const PRESENCE_TTL_SEC = Number(process.env.PRESENCE_TTL_SEC || 15);
+
+function presenceKey(uid) {
+  return `online:${uid}`;
+}
+
+async function touchPresence(uid) {
+  // SETEX key ttl "1"
+  await redis.set(presenceKey(uid), "1", "EX", PRESENCE_TTL_SEC);
+}
+
+async function isOnline(uid) {
+  const v = await redis.get(presenceKey(uid));
+  return v !== null;
+}
+
+async function onlineBatch(ids) {
+  const unique = Array.from(new Set(ids.map(Number).filter(x => Number.isInteger(x) && x > 0))).slice(0, 200);
+  if (!unique.length) return [];
+
+  const pipe = redis.pipeline();
+  for (const id of unique) pipe.get(presenceKey(id));
+  const results = await pipe.exec(); // [[err, val], ...]
+  return unique.map((id, idx) => ({ user_id: id, online: results[idx]?.[1] !== null }));
+}
+
+// -------------------- SSE + Postgres LISTEN/NOTIFY --------------------
+const sseClients = new Map(); // userId -> Set<{res, scope}>
+
+function addSseClient(userId, res, scope) {
+  const uid = Number(userId);
+  if (!sseClients.has(uid)) sseClients.set(uid, new Set());
+  const entry = { res, scope };
+  sseClients.get(uid).add(entry);
+  return entry;
+}
+
+function removeSseClient(userId, entry) {
+  const uid = Number(userId);
+  const set = sseClients.get(uid);
+  if (!set) return;
+  set.delete(entry);
+  if (set.size === 0) sseClients.delete(uid);
+}
+
+function sseSend(res, event, obj) {
+  const data = JSON.stringify(obj);
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${data}\n\n`);
+}
+
+function safeJson(s) {
+  try { return JSON.parse(s); } catch (_) { return { raw: s }; }
+}
+
+function broadcastToUser(uid, event, payload, scopeFilterFn = null) {
+  const set = sseClients.get(Number(uid));
+  if (!set) return;
+  for (const entry of set) {
+    if (scopeFilterFn && !scopeFilterFn(entry.scope)) continue;
+    sseSend(entry.res, event, payload);
+  }
+}
+
+// Subscriber (LISTEN)
+const subscriber = createSubscriber({ connectionString: DATABASE_URL });
+
+async function startSubscriber() {
+  try {
+    subscriber.notifications.on("global_messages", (payload) => {
+      const obj = safeJson(payload);
+      // пушим всем, кто сейчас слушает global
+      for (const [, set] of sseClients.entries()) {
+        for (const entry of set) {
+          if (entry.scope === "global") sseSend(entry.res, "global_message", obj);
+        }
+      }
+    });
+
+    subscriber.notifications.on("dm_messages", async (payload) => {
+      const obj = safeJson(payload);
+      const convId = obj?.conversation_id;
+      if (!convId) return;
+
+      const r = await pool.query(
+        "SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1",
+        [convId]
+      );
+      if (!r.rows.length) return;
+
+      const { user_low, user_high } = r.rows[0];
+
+      broadcastToUser(user_low, "dm_message", obj, (scope) => scope === "dm" || scope === `dm:${convId}`);
+      broadcastToUser(user_high, "dm_message", obj, (scope) => scope === "dm" || scope === `dm:${convId}`);
+    });
+
+    subscriber.events.on("error", (err) => console.error("❌ pg-listen error:", err?.message || err));
+
+    await subscriber.connect();
+    await subscriber.listenTo("global_messages");
+    await subscriber.listenTo("dm_messages");
+
+    console.log("✅ LISTEN/NOTIFY subscriber started");
+  } catch (e) {
+    console.error("❌ Failed to start subscriber:", e?.message || e);
+    setTimeout(startSubscriber, 5000);
+  }
+}
+startSubscriber();
+
+// SSE endpoint
+app.get("/events", authenticateToken, async (req, res) => {
+  const scope = (req.query.scope || "global").toString();
+
+  // SSE headers
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.(); // важно для установления SSE :contentReference[oaicite:5]{index=5}
+
+  await touchPresence(req.user.uid);
+
+  const entry = addSseClient(req.user.uid, res, scope);
+  sseSend(res, "hello", { ok: true, scope, server_time: new Date().toISOString() });
+
+  // keep-alive + presence heartbeat
+  const ka = setInterval(async () => {
+    try {
+      sseSend(res, "keepalive", { t: Date.now() });
+      await touchPresence(req.user.uid);
+    } catch (_) {
+      // если клиент отвалился — close обработает
+    }
+  }, 10000);
+
+  req.on("close", () => {
+    clearInterval(ka);
+    removeSseClient(req.user.uid, entry);
+  });
+});
+
+// -------------------- BASIC ROUTES --------------------
+app.get("/ping", async (req, res) => {
   res.json({ status: "ok", message: "pong", service: "game-mail-service", server_time: new Date().toISOString() });
 });
 
-/**
- * Поиск друзей по никнейму (публичный поиск внутри игры)
- * GET /users/search?nickname=кот&limit=20
- *
- * Возвращает список {id, nickname}
- * Важно: nickname у тебя НЕ уникальный → это норм, просто выдаём несколько.
- */
+// Presence endpoints
+app.get("/presence/online/:userId", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId) || userId <= 0) return res.status(400).json({ error: "bad userId" });
+
+  const online = await isOnline(userId);
+  res.json({ user_id: userId, online });
+});
+
+app.get("/presence/online-batch", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
+  const ids = (req.query.ids || "").toString().split(",").map(x => Number(x.trim()));
+  const online = await onlineBatch(ids);
+  res.json({ online });
+});
+
+// -------------------- USERS SEARCH --------------------
 app.get("/users/search", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
   const nickname = (req.query.nickname || "").toString().trim();
   const limit = clampInt(req.query.limit, 20, 1, 50);
 
   if (!nickname) return res.status(400).json({ error: "nickname query required" });
 
   try {
-    // ILIKE для регистронезависимого поиска
-    // Ограничиваем по префиксу: "кот%" — обычно лучше для UX и индексов, чем "%кот%"
     const r = await pool.query(
       `SELECT id, nickname
        FROM users
@@ -175,6 +346,8 @@ app.get("/users/search", authenticateToken, async (req, res) => {
 
 // -------------------- GLOBAL CHAT --------------------
 app.get("/chat/global/history", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
   const limit = clampInt(req.query.limit, 100, 1, 100);
   const beforeId = req.query.before_id ? Number(req.query.before_id) : null;
 
@@ -212,6 +385,8 @@ app.get("/chat/global/history", authenticateToken, async (req, res) => {
 });
 
 app.post("/chat/global/send", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
   const body = (req.body?.body || "").toString();
   if (!body.trim()) return res.status(400).json({ error: "Message body required" });
   if (body.length > 1024) return res.status(400).json({ error: "Message too long (max 1024)" });
@@ -242,6 +417,29 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
         sender: { user_id: me.id, nickname: me.nickname, header: `${me.nickname}#${me.id}` }
       }
     });
+  } catch (e) {
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// отметить “прочитано” global до id
+app.post("/chat/global/read", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
+  const last_read_id = Number(req.body?.last_read_id);
+  if (!Number.isInteger(last_read_id) || last_read_id < 0) return res.status(400).json({ error: "last_read_id must be integer >= 0" });
+
+  try {
+    await pool.query(
+      `INSERT INTO global_reads (user_id, last_read_id, updated_at)
+       VALUES ($1, $2, CURRENT_TIMESTAMP)
+       ON CONFLICT (user_id)
+       DO UPDATE SET last_read_id = GREATEST(global_reads.last_read_id, EXCLUDED.last_read_id),
+                     updated_at = CURRENT_TIMESTAMP`,
+      [req.user.uid, last_read_id]
+    );
+
+    res.json({ ok: true, last_read_id });
   } catch (e) {
     res.status(500).json({ error: "Database error" });
   }
@@ -303,6 +501,8 @@ async function getOrCreateDmConversation(userA, userB) {
 }
 
 app.post("/chat/dm/start", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
   const contactId = Number(req.body?.contact_user_id);
   if (!Number.isInteger(contactId) || contactId <= 0) return res.status(400).json({ error: "contact_user_id must be integer" });
   if (contactId === req.user.uid) return res.status(400).json({ error: "Cannot chat with yourself" });
@@ -319,6 +519,8 @@ app.post("/chat/dm/start", authenticateToken, async (req, res) => {
 });
 
 app.get("/chat/dm/:conversation_id/history", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
   const limit = clampInt(req.query.limit, 50, 1, 50);
   const beforeId = req.query.before_id ? Number(req.query.before_id) : null;
   const conversationId = req.params.conversation_id;
@@ -368,6 +570,8 @@ app.get("/chat/dm/:conversation_id/history", authenticateToken, async (req, res)
 });
 
 app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
   const conversationId = req.params.conversation_id;
   const body = (req.body?.body || "").toString();
 
@@ -448,27 +652,43 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
   }
 });
 
-app.get("/chat/contacts", authenticateToken, async (req, res) => {
+// -------------------- NOTIFICATIONS SUMMARY (unread counts) --------------------
+app.get("/notifications/summary", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
   try {
-    const r = await pool.query(
-      `SELECT c.contact_user_id, c.conversation_id, c.last_message_id, c.last_at, u.nickname
-       FROM dm_contacts c
-       JOIN users u ON u.id = c.contact_user_id
-       WHERE c.owner_user_id = $1
-       ORDER BY c.last_at DESC NULLS LAST
-       LIMIT 200`,
+    const dm = await pool.query(
+      `SELECT COUNT(*)::int AS cnt
+       FROM dm_contacts
+       WHERE owner_user_id = $1
+         AND COALESCE(last_message_id, 0) > COALESCE(last_read_message_id, 0)`,
+      [req.user.uid]
+    );
+
+    const gr = await pool.query(
+      `SELECT last_read_id FROM global_reads WHERE user_id = $1 LIMIT 1`,
+      [req.user.uid]
+    );
+    const lastRead = gr.rows.length ? Number(gr.rows[0].last_read_id) : 0;
+
+    const g = await pool.query(
+      `SELECT COUNT(*)::int AS cnt
+       FROM global_messages
+       WHERE id > $1`,
+      [lastRead]
+    );
+
+    const m = await pool.query(
+      `SELECT COUNT(*)::int AS cnt
+       FROM mails
+       WHERE to_user_id = $1 AND status = 'unread'`,
       [req.user.uid]
     );
 
     res.json({
-      contacts: r.rows.map(x => ({
-        contact_user_id: x.contact_user_id,
-        nickname: x.nickname,
-        header: `${x.nickname}#${x.contact_user_id}`,
-        conversation_id: x.conversation_id,
-        last_message_id: x.last_message_id,
-        last_at: x.last_at
-      }))
+      dm_unread: dm.rows[0].cnt,
+      global_unread: g.rows[0].cnt,
+      mail_unread: m.rows[0].cnt
     });
   } catch (e) {
     res.status(500).json({ error: "Database error" });
@@ -477,6 +697,8 @@ app.get("/chat/contacts", authenticateToken, async (req, res) => {
 
 // -------------------- MAIL --------------------
 app.get("/mail/inbox", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
   const limit = clampInt(req.query.limit, 50, 1, 50);
   const before = (req.query.before_at || "").toString().trim();
 
@@ -497,7 +719,6 @@ app.get("/mail/inbox", authenticateToken, async (req, res) => {
     const r = await pool.query(q, params);
 
     const next_before_at = r.rows.length ? r.rows[r.rows.length - 1].created_at : null;
-
     res.json({ limit, next_before_at, mails: r.rows });
   } catch (e) {
     res.status(500).json({ error: "Database error" });
@@ -505,8 +726,9 @@ app.get("/mail/inbox", authenticateToken, async (req, res) => {
 });
 
 app.get("/mail/:id", authenticateToken, async (req, res) => {
-  const id = req.params.id;
+  await touchPresence(req.user.uid);
 
+  const id = req.params.id;
   try {
     const r = await pool.query(
       `SELECT id, to_user_id, from_type, from_user_id, subject, body, reward_json, status, created_at
@@ -531,41 +753,10 @@ app.get("/mail/:id", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/mail/:id/read", authenticateToken, async (req, res) => {
-  const id = req.params.id;
-
-  try {
-    const upd = await pool.query(
-      `UPDATE mails
-       SET status = 'read'
-       WHERE id = $1 AND to_user_id = $2 AND status = 'unread'
-       RETURNING id, status`,
-      [id, req.user.uid]
-    );
-
-    if (upd.rows.length === 0) {
-      const chk = await pool.query(
-        `SELECT id, status FROM mails WHERE id = $1 AND to_user_id = $2 LIMIT 1`,
-        [id, req.user.uid]
-      );
-      if (chk.rows.length === 0) return res.status(404).json({ error: "Mail not found" });
-      return res.json({ mail: chk.rows[0] });
-    }
-
-    res.json({ mail: upd.rows[0] });
-  } catch (e) {
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-/**
- * Claim без idempotency-key:
- * одно письмо = один клейм
- * Повторный вызов просто возвращает already_claimed.
- */
 app.post("/mail/:id/claim", authenticateToken, async (req, res) => {
-  const id = req.params.id;
+  await touchPresence(req.user.uid);
 
+  const id = req.params.id;
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -584,7 +775,6 @@ app.post("/mail/:id/claim", authenticateToken, async (req, res) => {
     }
 
     const mail = mailR.rows[0];
-
     if (mail.status === "claimed") {
       await client.query("COMMIT");
       return res.json({ status: "already_claimed" });
@@ -648,4 +838,11 @@ app.post("/admin/mail/send", requireAdmin, async (req, res) => {
   }
 });
 
+// -------------------- START --------------------
 app.listen(PORT, () => console.log(`🚀 game-mail-service on port ${PORT}`));
+
+process.on("SIGINT", async () => {
+  try { await subscriber.close(); } catch (_) {}
+  try { await redis.quit(); } catch (_) {}
+  process.exit(0);
+});

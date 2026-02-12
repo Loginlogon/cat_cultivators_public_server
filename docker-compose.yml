@@ -16,6 +16,20 @@ services:
       timeout: 3s
       retries: 20
 
+  redis:
+    image: redis:7-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
   auth:
     build: ./auth-service
     restart: always
@@ -26,8 +40,11 @@ services:
       - ACCESS_SECRET=${ACCESS_SECRET}
       - REFRESH_SECRET=${REFRESH_SECRET}
       - ADMIN_SECRET_KEY=${ADMIN_SECRET_KEY}
+      - REDIS_URL=redis://redis:6379
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   game-mail:
@@ -39,9 +56,12 @@ services:
       - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db:5432/${DB_NAME}
       - ACCESS_SECRET=${ACCESS_SECRET}
       - ADMIN_SECRET_KEY=${ADMIN_SECRET_KEY}
+      - REDIS_URL=redis://redis:6379
       - PORT=3001
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   adminer:
@@ -52,3 +72,4 @@ services:
 
 volumes:
   db_data:
+  redis_data:
