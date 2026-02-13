@@ -9,7 +9,7 @@ Authorization: Bearer {{token}}
 Content-Type: application/json
 
 {
-  "body": "Привет из глобального!1"
+  "body": "Привк2ыыыыымаыаыыыы"
 }
 
 ### Global: history
@@ -40,7 +40,7 @@ Authorization: Bearer {{token}}
 Content-Type: application/json
 
 {
-  "body": "Привет в личку! "
+  "body": "Привет в личку!(плиииз 6) "
 }
 
 ### Contacts

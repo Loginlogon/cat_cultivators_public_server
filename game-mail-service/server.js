@@ -1,3 +1,5 @@
+'use strict';
+
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
@@ -6,29 +8,123 @@ const createSubscriber = require("pg-listen");
 const Redis = require("ioredis");
 const { readEnv } = require("./env");
 
+// -------------------- CONFIG --------------------
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-let ACCESS_SECRET, ADMIN_SECRET_KEY, DATABASE_URL, REDIS_URL, PORT;
+let ACCESS_SECRET, ADMIN_SECRET_KEY, DATABASE_URL, REDIS_URL, PORT, LOG_LEVEL;
 try {
   ACCESS_SECRET = readEnv("ACCESS_SECRET");
   ADMIN_SECRET_KEY = readEnv("ADMIN_SECRET_KEY");
   DATABASE_URL = readEnv("DATABASE_URL");
   REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
-  PORT = process.env.PORT || 3001;
+  PORT = Number(process.env.PORT || 3001);
+  LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
 } catch (e) {
   console.error("❌", e.message);
   process.exit(1);
 }
 
-const pool = new Pool({ connectionString: DATABASE_URL });
+const INSTANCE = process.env.INSTANCE_ID || require("os").hostname();
 
-// Redis (presence)
+// -------------------- LOGGER --------------------
+const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
+function shouldLog(level) {
+  const a = LEVELS[level] ?? 20;
+  const b = LEVELS[LOG_LEVEL] ?? 20;
+  return a >= b;
+}
+function log(level, msg, meta) {
+  if (!shouldLog(level)) return;
+  const out = {
+    t: new Date().toISOString(),
+    level,
+    msg,
+    meta: meta || undefined,
+  };
+  // eslint-disable-next-line no-console
+  console.log(JSON.stringify(out));
+}
+
+app.use((req, res, next) => {
+  const t0 = Date.now();
+  res.on("finish", () => {
+    log("debug", "http", {
+      method: req.method,
+      path: req.originalUrl || req.url,
+      code: res.statusCode,
+      ms: Date.now() - t0,
+    });
+  });
+  next();
+});
+
+// -------------------- DB --------------------
+const pool = new Pool({ connectionString: DATABASE_URL });
+pool.on("error", (err) => log("error", "pg.pool.error", { err: err?.message || String(err) }));
+
+// -------------------- REDIS (presence) --------------------
 const redis = new Redis(REDIS_URL, {
   enableAutoPipelining: false,
   lazyConnect: true,
 });
-redis.on("error", (e) => console.error("❌ Redis error:", e?.message || e));
+redis.on("error", (e) => log("error", "redis.error", { err: e?.message || String(e) }));
+
+let redisConnectPromise = null;
+async function ensureRedisConnected() {
+  try {
+    if (redis.status === "ready") return true;
+    if (redisConnectPromise) return redisConnectPromise;
+
+    redisConnectPromise = redis
+      .connect()
+      .then(() => {
+        log("info", "redis.connected", { url: "REDIS_URL", status: redis.status });
+        return true;
+      })
+      .catch((e) => {
+        log("error", "redis.connect.failed", { err: e?.message || String(e), status: redis.status });
+        return false;
+      })
+      .finally(() => {
+        redisConnectPromise = null;
+      });
+
+    return redisConnectPromise;
+  } catch (e) {
+    log("error", "redis.connect.failed", { err: e?.message || String(e), status: redis.status });
+    return false;
+  }
+}
+
+const PRESENCE_TTL_SEC = Number(process.env.PRESENCE_TTL_SEC || 15);
+function presenceKey(uid) {
+  return `online:${uid}`;
+}
+async function touchPresence(uid) {
+  const ok = await ensureRedisConnected();
+  if (!ok || redis.status !== "ready") return;
+  await redis.set(presenceKey(uid), "1", "EX", PRESENCE_TTL_SEC);
+}
+async function isOnline(uid) {
+  const ok = await ensureRedisConnected();
+  if (!ok || redis.status !== "ready") return false;
+  const v = await redis.get(presenceKey(uid));
+  return v !== null;
+}
+async function onlineBatch(ids) {
+  const ok = await ensureRedisConnected();
+  if (!ok || redis.status !== "ready") return [];
+
+  const unique = Array.from(new Set(ids.map(Number).filter((x) => Number.isInteger(x) && x > 0))).slice(0, 200);
+  if (!unique.length) return [];
+
+  const pipe = redis.pipeline();
+  for (const id of unique) pipe.get(presenceKey(id));
+  const results = await pipe.exec();
+
+  return unique.map((id, idx) => ({ user_id: id, online: results[idx]?.[1] !== null }));
+}
 
 // -------------------- HELPERS --------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -48,7 +144,6 @@ const requireAdmin = (req, res, next) => {
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
-
   if (!token) return res.status(401).json({ error: "Token missing" });
 
   jwt.verify(token, ACCESS_SECRET, (err, payload) => {
@@ -70,12 +165,10 @@ let _admin = null;
 function getFirebaseAdmin() {
   if (_admin) return _admin;
   try {
-    // ленивый require: если пакета нет — сервис не падает
-    // (но пуши будут отключены)
     _admin = require("firebase-admin");
     return _admin;
   } catch (e) {
-    console.warn("⚠️ firebase-admin not installed, push disabled");
+    log("warn", "firebase.not_installed", { note: "firebase-admin not installed, push disabled" });
     return null;
   }
 }
@@ -88,7 +181,7 @@ function initFirebaseOnce() {
 
   const json = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   if (!json) {
-    console.warn("⚠️ FIREBASE_SERVICE_ACCOUNT_JSON not set, push disabled");
+    log("warn", "firebase.no_service_account_json", { note: "FIREBASE_SERVICE_ACCOUNT_JSON not set, push disabled" });
     return false;
   }
 
@@ -98,10 +191,10 @@ function initFirebaseOnce() {
       credential: admin.credential.cert(serviceAccount),
     });
     firebaseReady = true;
-    console.log("✅ Firebase Admin initialized");
+    log("info", "firebase.ready");
     return true;
   } catch (e) {
-    console.error("❌ Firebase init failed:", e?.message || e);
+    log("error", "firebase.init_failed", { err: e?.message || String(e) });
     return false;
   }
 }
@@ -114,7 +207,10 @@ async function sendDmPush(toUserId, { title, body, data }) {
 
   const t = await pool.query(`SELECT token FROM push_tokens WHERE user_id = $1`, [toUserId]);
   const tokens = t.rows.map((r) => r.token).filter(Boolean);
-  if (!tokens.length) return;
+  if (!tokens.length) {
+    log("debug", "push.skip.no_tokens", { toUserId });
+    return;
+  }
 
   const payloadData = {
     ...(data || {}),
@@ -122,6 +218,8 @@ async function sendDmPush(toUserId, { title, body, data }) {
     title: String(title || ""),
     body: String(body || ""),
   };
+
+  log("debug", "push.send.start", { toUserId, tokens: tokens.length });
 
   const resp = await admin.messaging().sendEachForMulticast({
     tokens,
@@ -146,13 +244,100 @@ async function sendDmPush(toUserId, { title, body, data }) {
       `DELETE FROM push_tokens WHERE user_id = $1 AND token = ANY($2::text[])`,
       [toUserId, dead]
     );
+    log("warn", "push.tokens.cleaned", { toUserId, dead: dead.length });
+  }
+
+  log("info", "push.send.done", { toUserId, ok: resp.successCount, total: tokens.length });
+}
+
+// -------------------- SSE --------------------
+// ВАЖНО: отправляем без `event:` чтобы клиент, который слушает только default "message", тоже работал.
+// Тип события кладём в JSON: { type: "global_message" | "dm_message" | ... }
+
+const sseClients = new Map(); // userId -> Set<entry>
+let sseConnSeq = 0;
+
+function addSseClient(userId, res, scope) {
+  const uid = Number(userId);
+  if (!sseClients.has(uid)) sseClients.set(uid, new Set());
+  const entry = { res, scope, connId: ++sseConnSeq, createdAt: Date.now() };
+  sseClients.get(uid).add(entry);
+  log("info", "sse.client.add", { uid, scope, connId: entry.connId, totalForUser: sseClients.get(uid).size });
+  return entry;
+}
+
+function removeSseClient(userId, entry, reason) {
+  const uid = Number(userId);
+  const set = sseClients.get(uid);
+  if (!set) return;
+  set.delete(entry);
+  if (set.size === 0) sseClients.delete(uid);
+  log("info", "sse.client.remove", { uid, scope: entry.scope, connId: entry.connId, reason: reason || "unknown" });
+}
+
+// SSE frame (без event:)
+function sseSend(res, obj, id = null) {
+  const data = JSON.stringify(obj);
+  if (id !== null && id !== undefined) res.write(`id: ${String(id)}\n`);
+  res.write(`data: ${data}\n\n`);
+}
+
+function sseComment(res, text) {
+  // Комментарии начинаются с ":" — удобно как keep-alive. :contentReference[oaicite:1]{index=1}
+  res.write(`: ${text}\n\n`);
+}
+
+function safeJson(s) {
+  try {
+    return JSON.parse(s);
+  } catch (_) {
+    return { raw: s };
   }
 }
 
+function broadcastToUser(uid, payload, scopeFilterFn = null, id = null) {
+  const set = sseClients.get(Number(uid));
+  if (!set) return 0;
+  let sent = 0;
+  for (const entry of set) {
+    if (scopeFilterFn && !scopeFilterFn(entry.scope)) continue;
+    try {
+      sseSend(entry.res, payload, id);
+      sent++;
+    } catch (e) {
+      // если клиент отвалился — убираем
+      try { entry.res.end(); } catch (_) {}
+      removeSseClient(uid, entry, "write_failed");
+    }
+  }
+  return sent;
+}
 
+// -------------------- DEDUPE (direct + NOTIFY) --------------------
+const RECENT_TTL_MS = Number(process.env.RECENT_TTL_MS || 10000);
+const recentGlobal = new Map(); // id -> ts
+const recentDm = new Map();     // id -> ts
+
+function markRecent(map, key) {
+  map.set(String(key), Date.now());
+}
+function wasRecent(map, key) {
+  const k = String(key);
+  const ts = map.get(k);
+  if (!ts) return false;
+  if (Date.now() - ts < RECENT_TTL_MS) return true;
+  map.delete(k);
+  return false;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, ts] of recentGlobal.entries()) if (now - ts > RECENT_TTL_MS) recentGlobal.delete(k);
+  for (const [k, ts] of recentDm.entries()) if (now - ts > RECENT_TTL_MS) recentDm.delete(k);
+}, 5000).unref?.();
 
 // -------------------- DB: triggers for NOTIFY --------------------
 async function ensureNotifyTriggers(client) {
+  // ✅ ДОБАВИЛИ body в payload (это критично для обновления чата)
   await client.query(`
     CREATE OR REPLACE FUNCTION notify_global_message() RETURNS trigger AS $$
     BEGIN
@@ -162,6 +347,7 @@ async function ensureNotifyTriggers(client) {
           'id', NEW.id,
           'user_id', NEW.user_id,
           'nickname', NEW.nickname,
+          'body', NEW.body,
           'created_at', NEW.created_at
         )::text
       );
@@ -170,6 +356,7 @@ async function ensureNotifyTriggers(client) {
     $$ LANGUAGE plpgsql;
   `);
 
+  // ✅ ДОБАВИЛИ body в payload (это критично для DM)
   await client.query(`
     CREATE OR REPLACE FUNCTION notify_dm_message() RETURNS trigger AS $$
     BEGIN
@@ -180,6 +367,7 @@ async function ensureNotifyTriggers(client) {
           'conversation_id', NEW.conversation_id,
           'sender_user_id', NEW.sender_user_id,
           'sender_nickname', NEW.sender_nickname,
+          'body', NEW.body,
           'created_at', NEW.created_at
         )::text
       );
@@ -201,6 +389,8 @@ async function ensureNotifyTriggers(client) {
     AFTER INSERT ON dm_messages
     FOR EACH ROW EXECUTE FUNCTION notify_dm_message();
   `);
+
+  log("info", "db.triggers.ready");
 }
 
 // -------------------- DB INIT + "soft migrations" --------------------
@@ -252,8 +442,6 @@ async function initDbForever() {
         );
       `);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_messages_conv_id_desc ON dm_messages(conversation_id, id DESC);`);
-
-      // ✅ для unread_count
       await client.query(`
         CREATE INDEX IF NOT EXISTS idx_dm_messages_conv_sender_id_desc
         ON dm_messages(conversation_id, sender_user_id, id DESC);
@@ -298,7 +486,6 @@ async function initDbForever() {
         );
       `);
 
-      // ✅ PUSH TOKENS (миграция)
       await client.query(`
         CREATE TABLE IF NOT EXISTS push_tokens (
           user_id INTEGER NOT NULL,
@@ -313,20 +500,17 @@ async function initDbForever() {
       await ensureNotifyTriggers(client);
 
       await client.query("COMMIT");
-
-      console.log("✅ game-mail-service: DB initialized (tables + migrations + triggers)");
+      log("info", "db.ready");
 
       if (!subscriberStarted) {
         subscriberStarted = true;
-        startSubscriber().catch((e) => console.error("❌ subscriber start failed:", e?.message || e));
+        startSubscriber().catch((e) => log("error", "subscriber.start.failed", { err: e?.message || String(e) }));
       }
 
       return;
     } catch (err) {
-      try {
-        await client.query("ROLLBACK");
-      } catch (_) {}
-      console.error("❌ DB init error:", err?.message || err, "Retrying in 5s...");
+      try { await client.query("ROLLBACK"); } catch (_) {}
+      log("error", "db.init.failed", { err: err?.message || String(err) });
       await sleep(5000);
     } finally {
       client.release();
@@ -334,143 +518,7 @@ async function initDbForever() {
   }
 }
 
-// -------------------- REDIS PRESENCE --------------------
-const PRESENCE_TTL_SEC = Number(process.env.PRESENCE_TTL_SEC || 15);
-
-function presenceKey(uid) {
-  return `online:${uid}`;
-}
-
-async function ensureRedisConnected() {
-  try {
-    if (redis.status === "ready") return;
-    if (redis.status === "connecting") return;
-    await redis.connect();
-  } catch (e) {
-    console.error("❌ Redis connect failed:", e?.message || e);
-  }
-}
-
-async function touchPresence(uid) {
-  await ensureRedisConnected();
-  if (redis.status !== "ready") return;
-  await redis.set(presenceKey(uid), "1", "EX", PRESENCE_TTL_SEC);
-}
-
-async function isOnline(uid) {
-  await ensureRedisConnected();
-  if (redis.status !== "ready") return false;
-  const v = await redis.get(presenceKey(uid));
-  return v !== null;
-}
-
-async function onlineBatch(ids) {
-  await ensureRedisConnected();
-  if (redis.status !== "ready") return [];
-
-  const unique = Array.from(new Set(ids.map(Number).filter((x) => Number.isInteger(x) && x > 0))).slice(0, 200);
-  if (!unique.length) return [];
-
-  const pipe = redis.pipeline();
-  for (const id of unique) pipe.get(presenceKey(id));
-  const results = await pipe.exec();
-  return unique.map((id, idx) => ({ user_id: id, online: results[idx]?.[1] !== null }));
-}
-
-// -------------------- SSE + Postgres LISTEN/NOTIFY --------------------
-const sseClients = new Map(); // userId -> Set<{res, scope}>
-
-function addSseClient(userId, res, scope) {
-  const uid = Number(userId);
-  if (!sseClients.has(uid)) sseClients.set(uid, new Set());
-  const entry = { res, scope };
-  sseClients.get(uid).add(entry);
-  return entry;
-}
-
-function removeSseClient(userId, entry) {
-  const uid = Number(userId);
-  const set = sseClients.get(uid);
-  if (!set) return;
-  set.delete(entry);
-  if (set.size === 0) sseClients.delete(uid);
-}
-
-function sseSend(res, event, obj) {
-  const data = JSON.stringify(obj);
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${data}\n\n`);
-}
-
-function safeJson(s) {
-  try {
-    return JSON.parse(s);
-  } catch (_) {
-    return { raw: s };
-  }
-}
-
-function broadcastToUser(uid, event, payload, scopeFilterFn = null) {
-  const set = sseClients.get(Number(uid));
-  if (!set) return;
-  for (const entry of set) {
-    if (scopeFilterFn && !scopeFilterFn(entry.scope)) continue;
-    sseSend(entry.res, event, payload);
-  }
-}
-
-// Subscriber (LISTEN)
-const subscriber = createSubscriber({ connectionString: DATABASE_URL });
-
-async function startSubscriber() {
-  try {
-    subscriber.notifications.on("global_messages", (payload) => {
-      const obj = safeJson(payload);
-      for (const [, set] of sseClients.entries()) {
-        for (const entry of set) {
-          if (entry.scope === "global") sseSend(entry.res, "global_message", obj);
-        }
-      }
-    });
-
-    subscriber.notifications.on("dm_messages", (payload) => {
-      (async () => {
-        try {
-          const obj = safeJson(payload);
-          const convId = obj?.conversation_id;
-          if (!convId) return;
-
-          const r = await pool.query(
-            "SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1",
-            [convId]
-          );
-          if (!r.rows.length) return;
-
-          const { user_low, user_high } = r.rows[0];
-
-          broadcastToUser(user_low, "dm_message", obj, (scope) => scope === "dm" || scope === `dm:${convId}`);
-          broadcastToUser(user_high, "dm_message", obj, (scope) => scope === "dm" || scope === `dm:${convId}`);
-        } catch (e) {
-          console.error("❌ dm_messages handler failed:", e?.message || e);
-        }
-      })();
-    });
-
-    subscriber.events.on("error", (err) => console.error("❌ pg-listen error:", err?.message || err));
-
-    await subscriber.connect();
-    await subscriber.listenTo("global_messages");
-    await subscriber.listenTo("dm_messages");
-
-    console.log("✅ LISTEN/NOTIFY subscriber started");
-  } catch (e) {
-    console.error("❌ Failed to start subscriber:", e?.message || e);
-    await sleep(5000);
-    return startSubscriber();
-  }
-}
-
-// SSE endpoint
+// -------------------- SSE endpoint --------------------
 app.get("/events", authenticateToken, async (req, res) => {
   const scope = (req.query.scope || "global").toString();
 
@@ -483,19 +531,31 @@ app.get("/events", authenticateToken, async (req, res) => {
 
   await touchPresence(req.user.uid);
 
-  const entry = addSseClient(req.user.uid, res, scope);
-  sseSend(res, "hello", { ok: true, scope, server_time: new Date().toISOString() });
+  // retry — если клиент отвалился, пусть пытается переподключаться
+  try { res.write(`retry: 3000\n\n`); } catch (_) {}
 
+  const entry = addSseClient(req.user.uid, res, scope);
+
+  // hello (без event:, type внутри JSON)
+  sseSend(res, {
+    type: "hello",
+    ok: true,
+    scope,
+    server_time: new Date().toISOString(),
+    instance: INSTANCE,
+  });
+
+  // keep-alive
   const ka = setInterval(async () => {
     try {
-      sseSend(res, "keepalive", { t: Date.now() });
+      sseComment(res, `keepalive ${Date.now()}`);
       await touchPresence(req.user.uid);
     } catch (_) {}
-  }, 10000);
+  }, 15000);
 
   req.on("close", () => {
     clearInterval(ka);
-    removeSseClient(req.user.uid, entry);
+    removeSseClient(req.user.uid, entry, "client_close");
   });
 });
 
@@ -518,19 +578,19 @@ app.post("/push/register", authenticateToken, async (req, res) => {
        DO UPDATE SET updated_at = CURRENT_TIMESTAMP`,
       [req.user.uid, token]
     );
+    log("info", "push.register.ok", { uid: req.user.uid, tokenLen: token.length });
     res.json({ ok: true });
   } catch (e) {
+    log("error", "push.register.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
 
-
-
-// -------------------- Presence: force offline --------------------
+// -------------------- Presence --------------------
 app.post("/presence/offline", authenticateToken, async (req, res) => {
   try {
-    await ensureRedisConnected();
-    if (redis.status === "ready") {
+    const ok = await ensureRedisConnected();
+    if (ok && redis.status === "ready") {
       await redis.del(presenceKey(req.user.uid));
     }
   } catch (_) {}
@@ -579,6 +639,7 @@ app.get("/users/search", authenticateToken, async (req, res) => {
       users: r.rows.map((u) => ({ id: u.id, nickname: u.nickname, header: `${u.nickname}#${u.id}` })),
     });
   } catch (e) {
+    log("error", "users.search.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -615,6 +676,7 @@ app.get("/chat/global/history", authenticateToken, async (req, res) => {
     const next_before_id = items.length ? items[0].id : null;
     res.json({ limit, next_before_id, messages: items });
   } catch (e) {
+    log("error", "global.history.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -637,6 +699,7 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
       [me.id, me.nickname, body]
     );
 
+    // чистка до 100
     await pool.query(`
       DELETE FROM global_messages
       WHERE id NOT IN (
@@ -644,15 +707,45 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
       )
     `);
 
+    const msgId = insert.rows[0].id;
+    const createdAt = insert.rows[0].created_at;
+
+    // ✅ direct broadcast (и дедуп на случай, если прилетит NOTIFY)
+    const payload = {
+      type: "global_message",
+      id: msgId,
+      user_id: me.id,
+      nickname: me.nickname,
+      body,
+      created_at: createdAt,
+      instance: INSTANCE,
+      source: "direct",
+    };
+
+    markRecent(recentGlobal, msgId);
+    let sent = 0;
+    for (const [, set] of sseClients.entries()) {
+      for (const entry of set) {
+        if (entry.scope === "global") {
+          try {
+            sseSend(entry.res, payload, msgId);
+            sent++;
+          } catch (_) {}
+        }
+      }
+    }
+    log("info", "global.event.sse.sent", { msgId, source: "direct", sent });
+
     res.status(201).json({
       message: "sent",
       data: {
-        id: insert.rows[0].id,
-        created_at: insert.rows[0].created_at,
+        id: msgId,
+        created_at: createdAt,
         sender: { user_id: me.id, nickname: me.nickname, header: `${me.nickname}#${me.id}` },
       },
     });
   } catch (e) {
+    log("error", "global.send.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -677,6 +770,7 @@ app.post("/chat/global/read", authenticateToken, async (req, res) => {
 
     res.json({ ok: true, last_read_id });
   } catch (e) {
+    log("error", "global.read.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -750,6 +844,7 @@ app.post("/chat/dm/start", authenticateToken, async (req, res) => {
     const cid = await getOrCreateDmConversation(req.user.uid, contactId);
     res.json({ conversation_id: cid, contact: { user_id: other.id, nickname: other.nickname, header: `${other.nickname}#${other.id}` } });
   } catch (e) {
+    log("error", "dm.start.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -797,6 +892,7 @@ app.get("/chat/dm/:conversation_id/history", authenticateToken, async (req, res)
     const next_before_id = items.length ? items[0].id : null;
     res.json({ conversation_id: conversationId, limit, next_before_id, messages: items });
   } catch (e) {
+    log("error", "dm.history.failed", { err: e?.message || String(e), conversationId });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -838,11 +934,13 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
       return res.status(401).json({ error: "User not found" });
     }
 
+    const myNick = me.rows[0].nickname;
+
     const ins = await client.query(
       `INSERT INTO dm_messages (conversation_id, sender_user_id, sender_nickname, body)
        VALUES ($1, $2, $3, $4)
        RETURNING id, created_at`,
-      [conversationId, req.user.uid, me.rows[0].nickname, body]
+      [conversationId, req.user.uid, myNick, body]
     );
 
     const msgId = ins.rows[0].id;
@@ -850,6 +948,7 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
 
     const otherId = req.user.uid === user_low ? user_high : user_low;
 
+    // dm_contacts upsert for both sides
     await client.query(
       `INSERT INTO dm_contacts (owner_user_id, contact_user_id, conversation_id, last_message_id, last_at)
        VALUES ($1, $2, $3, $4, $5)
@@ -872,36 +971,50 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
 
     await client.query("COMMIT");
 
-    // SSE: сразу
+    // ✅ direct SSE (и дедуп на NOTIFY)
     const ssePayload = {
+      type: "dm_message",
       id: msgId,
       conversation_id: conversationId,
       sender_user_id: req.user.uid,
-      sender_nickname: me.rows[0].nickname,
+      sender_nickname: myNick,
+      body,                // ✅ ВАЖНО
       created_at: createdAt,
+      instance: INSTANCE,
+      source: "direct",
     };
 
-    broadcastToUser(user_low, "dm_message", ssePayload, (scope) => scope === "dm" || scope === `dm:${conversationId}`);
-    broadcastToUser(user_high, "dm_message", ssePayload, (scope) => scope === "dm" || scope === `dm:${conversationId}`);
+    markRecent(recentDm, msgId);
 
-    // ✅ PUSH: только получателю и только если оффлайн по presence
+    const toLow = broadcastToUser(
+      user_low,
+      ssePayload,
+      (scope) => scope === "dm" || scope === `dm:${conversationId}`,
+      msgId
+    );
+    const toHigh = broadcastToUser(
+      user_high,
+      ssePayload,
+      (scope) => scope === "dm" || scope === `dm:${conversationId}`,
+      msgId
+    );
+
+    log("info", "dm.event.sse.sent", { msgId, convId: conversationId, source: "direct", toLow, toHigh });
+
+    // ✅ PUSH always to receiver
     try {
-      const receiverId = otherId;
-      const receiverOnline = await isOnline(receiverId);
-      if (!receiverOnline) {
-        await sendDmPush(receiverId, {
-          title: `Сообщение от ${me.rows[0].nickname}`,
-          body: body.length > 120 ? body.slice(0, 120) + "…" : body,
-          data: {
-            type: "dm",
-            conversation_id: conversationId,
-            sender_user_id: req.user.uid,
-            sender_nickname: me.rows[0].nickname,
-          },
-        });
-      }
+      await sendDmPush(otherId, {
+        title: `Сообщение от ${myNick}`,
+        body: body.length > 120 ? body.slice(0, 120) + "…" : body,
+        data: {
+          type: "dm",
+          conversation_id: conversationId,
+          sender_user_id: req.user.uid,
+          sender_nickname: myNick,
+        },
+      });
     } catch (e) {
-      console.warn("⚠️ sendDmPush failed:", e?.message || e);
+      log("warn", "push.send.failed", { err: e?.message || String(e) });
     }
 
     res.status(201).json({
@@ -911,20 +1024,21 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
         created_at: createdAt,
         sender: {
           user_id: req.user.uid,
-          nickname: me.rows[0].nickname,
-          header: `${me.rows[0].nickname}#${req.user.uid}`,
+          nickname: myNick,
+          header: `${myNick}#${req.user.uid}`,
         },
       },
     });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch (_) {}
+    log("error", "dm.send.failed", { err: e?.message || String(e), conversationId });
     res.status(500).json({ error: "Database error" });
   } finally {
     client.release();
   }
 });
 
-// DM contacts list (✅ unread_count)
+// DM contacts list (unread_count)
 app.get("/chat/contacts", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -965,6 +1079,7 @@ app.get("/chat/contacts", authenticateToken, async (req, res) => {
       })),
     });
   } catch (e) {
+    log("error", "contacts.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -1004,11 +1119,12 @@ app.post("/chat/dm/:conversation_id/read", authenticateToken, async (req, res) =
 
     res.json({ ok: true, conversation_id: conversationId, last_read_message_id });
   } catch (e) {
+    log("error", "dm.read.failed", { err: e?.message || String(e), conversationId });
     res.status(500).json({ error: "Database error" });
   }
 });
 
-// -------------------- NOTIFICATIONS SUMMARY (threads + messages) --------------------
+// -------------------- NOTIFICATIONS SUMMARY --------------------
 app.get("/notifications/summary", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -1042,11 +1158,12 @@ app.get("/notifications/summary", authenticateToken, async (req, res) => {
       mail_unread: m.rows[0].cnt,
     });
   } catch (e) {
+    log("error", "notifications.summary.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
 
-// -------------------- MAIL (как было) --------------------
+// -------------------- MAIL --------------------
 app.get("/mail/inbox", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -1072,6 +1189,7 @@ app.get("/mail/inbox", authenticateToken, async (req, res) => {
     const next_before_at = r.rows.length ? r.rows[r.rows.length - 1].created_at : null;
     res.json({ limit, next_before_at, mails: r.rows });
   } catch (e) {
+    log("error", "mail.inbox.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -1100,6 +1218,7 @@ app.get("/mail/:id", authenticateToken, async (req, res) => {
 
     res.json({ mail: r.rows[0] });
   } catch (e) {
+    log("error", "mail.get.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -1126,6 +1245,7 @@ app.post("/mail/:id/read", authenticateToken, async (req, res) => {
 
     res.json({ mail: upd.rows[0] });
   } catch (e) {
+    log("error", "mail.read.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -1178,6 +1298,7 @@ app.post("/mail/:id/claim", authenticateToken, async (req, res) => {
     res.json({ status: "claimed", applied: { money_mortals: addMortals, money_cultivators: addCult } });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch (_) {}
+    log("error", "mail.claim.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   } finally {
     client.release();
@@ -1207,22 +1328,126 @@ app.post("/admin/mail/send", requireAdmin, async (req, res) => {
 
     res.status(201).json({ message: "sent", mail_id: id });
   } catch (e) {
+    log("error", "admin.mail.send.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
 
+// -------------------- SSE + Postgres LISTEN/NOTIFY --------------------
+const subscriber = createSubscriber({ connectionString: DATABASE_URL });
+
+async function startSubscriber() {
+  try {
+    log("info", "subscriber.connecting", { url: "DATABASE_URL", instance: INSTANCE });
+
+    subscriber.notifications.on("global_messages", (payload) => {
+      log("debug", "notify.global_messages");
+      const obj = safeJson(payload);
+      const msgId = obj?.id;
+
+      // дедуп: если это уже ушло direct — не повторяем
+      if (msgId && wasRecent(recentGlobal, msgId)) {
+        log("debug", "notify.global_messages.skipped_recent", { msgId });
+        return;
+      }
+
+      const out = {
+        type: "global_message",
+        id: obj.id,
+        user_id: obj.user_id,
+        nickname: obj.nickname,
+        body: obj.body, // ✅ ВАЖНО
+        created_at: obj.created_at,
+        instance: INSTANCE,
+        source: "notify",
+      };
+
+      let sent = 0;
+      for (const [, set] of sseClients.entries()) {
+        for (const entry of set) {
+          if (entry.scope === "global") {
+            try { sseSend(entry.res, out, msgId || null); sent++; } catch (_) {}
+          }
+        }
+      }
+      log("info", "global.event.sse.sent", { msgId, source: "notify", sent });
+    });
+
+    subscriber.notifications.on("dm_messages", (payload) => {
+      log("debug", "notify.dm_messages");
+      (async () => {
+        try {
+          const obj = safeJson(payload);
+          const msgId = obj?.id;
+
+          // дедуп: если уже ушло direct — не повторяем
+          if (msgId && wasRecent(recentDm, msgId)) {
+            log("debug", "notify.dm_messages.skipped_recent", { msgId });
+            return;
+          }
+
+          const convId = obj?.conversation_id;
+          if (!convId) return;
+
+          const r = await pool.query(
+            "SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1",
+            [convId]
+          );
+          if (!r.rows.length) return;
+
+          const { user_low, user_high } = r.rows[0];
+
+          const out = {
+            type: "dm_message",
+            id: obj.id,
+            conversation_id: convId,
+            sender_user_id: obj.sender_user_id,
+            sender_nickname: obj.sender_nickname,
+            body: obj.body, // ✅ ВАЖНО
+            created_at: obj.created_at,
+            instance: INSTANCE,
+            source: "notify",
+          };
+
+          const toLow = broadcastToUser(user_low, out, (scope) => scope === "dm" || scope === `dm:${convId}`, msgId || null);
+          const toHigh = broadcastToUser(user_high, out, (scope) => scope === "dm" || scope === `dm:${convId}`, msgId || null);
+
+          log("info", "dm.event.sse.sent", { msgId, convId, source: "notify", toLow, toHigh });
+        } catch (e) {
+          log("error", "dm.notify.handler.failed", { err: e?.message || String(e) });
+        }
+      })();
+    });
+
+    subscriber.events.on("error", (err) => log("error", "pg-listen.error", { err: err?.message || String(err) }));
+
+    await subscriber.connect();
+    await subscriber.listenTo("global_messages");
+    await subscriber.listenTo("dm_messages");
+
+    log("info", "subscriber.ready");
+  } catch (e) {
+    log("error", "subscriber.failed", { err: e?.message || String(e) });
+    await sleep(5000);
+    return startSubscriber();
+  }
+}
+
 // -------------------- START --------------------
 async function main() {
+  log("info", "boot", { instance: INSTANCE, port: PORT, log_level: LOG_LEVEL, has_firebase_json: !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON });
   await initDbForever();
-  app.listen(PORT, () => console.log(`🚀 game-mail-service on port ${PORT}`));
+
+  app.listen(PORT, () => log("info", "http.listening", { port: PORT, instance: INSTANCE }));
 }
 
 main().catch((e) => {
-  console.error("❌ fatal:", e?.message || e);
+  log("error", "fatal", { err: e?.message || String(e) });
   process.exit(1);
 });
 
 process.on("SIGINT", async () => {
+  log("warn", "sigint");
   try { await subscriber.close(); } catch (_) {}
   try { await redis.quit(); } catch (_) {}
   process.exit(0);
