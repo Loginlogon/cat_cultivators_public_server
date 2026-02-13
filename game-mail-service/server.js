@@ -4,7 +4,6 @@ const { Pool } = require("pg");
 const { v4: uuidv4 } = require("uuid");
 const createSubscriber = require("pg-listen");
 const Redis = require("ioredis");
-const admin = require("firebase-admin");
 const { readEnv } = require("./env");
 
 const app = express();
@@ -117,10 +116,16 @@ async function sendDmPush(toUserId, { title, body, data }) {
   const tokens = t.rows.map((r) => r.token).filter(Boolean);
   if (!tokens.length) return;
 
+  const payloadData = {
+    ...(data || {}),
+    type: "dm",
+    title: String(title || ""),
+    body: String(body || ""),
+  };
+
   const resp = await admin.messaging().sendEachForMulticast({
     tokens,
-    notification: { title, body },
-    data: Object.fromEntries(Object.entries(data || {}).map(([k, v]) => [k, String(v)])),
+    data: Object.fromEntries(Object.entries(payloadData).map(([k, v]) => [k, String(v)])),
     android: { priority: "high" },
   });
 
@@ -143,6 +148,7 @@ async function sendDmPush(toUserId, { title, body, data }) {
     );
   }
 }
+
 
 
 // -------------------- DB: triggers for NOTIFY --------------------
@@ -500,8 +506,6 @@ app.get("/ping", (req, res) => {
 
 // -------------------- PUSH: register token --------------------
 app.post("/push/register", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-
   const token = (req.body?.token || "").toString().trim();
   if (!token) return res.status(400).json({ error: "token required" });
   if (token.length > 4096) return res.status(400).json({ error: "token too long" });
@@ -520,7 +524,19 @@ app.post("/push/register", authenticateToken, async (req, res) => {
   }
 });
 
-// -------------------- Presence endpoints --------------------
+
+
+// -------------------- Presence: force offline --------------------
+app.post("/presence/offline", authenticateToken, async (req, res) => {
+  try {
+    await ensureRedisConnected();
+    if (redis.status === "ready") {
+      await redis.del(presenceKey(req.user.uid));
+    }
+  } catch (_) {}
+  res.json({ ok: true });
+});
+
 app.get("/presence/online/:userId", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
