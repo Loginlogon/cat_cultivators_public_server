@@ -53,6 +53,7 @@ services:
     ports:
       - "3001:3001"
     environment:
+      - FIREBASE_SERVICE_ACCOUNT_JSON=${FIREBASE_SERVICE_ACCOUNT_JSON}
       - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db:5432/${DB_NAME}
       - ACCESS_SECRET=${ACCESS_SECRET}
       - ADMIN_SECRET_KEY=${ADMIN_SECRET_KEY}

@@ -4,6 +4,7 @@ const { Pool } = require("pg");
 const { v4: uuidv4 } = require("uuid");
 const createSubscriber = require("pg-listen");
 const Redis = require("ioredis");
+const admin = require("firebase-admin");
 const { readEnv } = require("./env");
 
 const app = express();
@@ -52,9 +53,7 @@ const authenticateToken = (req, res, next) => {
   if (!token) return res.status(401).json({ error: "Token missing" });
 
   jwt.verify(token, ACCESS_SECRET, (err, payload) => {
-    if (err) {
-      return res.status(401).json({ error: "Access token expired or invalid" });
-    }
+    if (err) return res.status(401).json({ error: "Access token expired or invalid" });
     req.user = payload; // { uid, login }
     next();
   });
@@ -64,6 +63,87 @@ async function getUserBasic(userId) {
   const r = await pool.query("SELECT id, login, nickname FROM users WHERE id = $1 LIMIT 1", [userId]);
   return r.rows[0] || null;
 }
+
+// -------------------- FIREBASE (FCM) --------------------
+let firebaseReady = false;
+let _admin = null;
+
+function getFirebaseAdmin() {
+  if (_admin) return _admin;
+  try {
+    // ленивый require: если пакета нет — сервис не падает
+    // (но пуши будут отключены)
+    _admin = require("firebase-admin");
+    return _admin;
+  } catch (e) {
+    console.warn("⚠️ firebase-admin not installed, push disabled");
+    return null;
+  }
+}
+
+function initFirebaseOnce() {
+  if (firebaseReady) return true;
+
+  const admin = getFirebaseAdmin();
+  if (!admin) return false;
+
+  const json = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (!json) {
+    console.warn("⚠️ FIREBASE_SERVICE_ACCOUNT_JSON not set, push disabled");
+    return false;
+  }
+
+  try {
+    const serviceAccount = JSON.parse(json);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    firebaseReady = true;
+    console.log("✅ Firebase Admin initialized");
+    return true;
+  } catch (e) {
+    console.error("❌ Firebase init failed:", e?.message || e);
+    return false;
+  }
+}
+
+async function sendDmPush(toUserId, { title, body, data }) {
+  if (!initFirebaseOnce()) return;
+
+  const admin = getFirebaseAdmin();
+  if (!admin) return;
+
+  const t = await pool.query(`SELECT token FROM push_tokens WHERE user_id = $1`, [toUserId]);
+  const tokens = t.rows.map((r) => r.token).filter(Boolean);
+  if (!tokens.length) return;
+
+  const resp = await admin.messaging().sendEachForMulticast({
+    tokens,
+    notification: { title, body },
+    data: Object.fromEntries(Object.entries(data || {}).map(([k, v]) => [k, String(v)])),
+    android: { priority: "high" },
+  });
+
+  const dead = [];
+  resp.responses.forEach((r, idx) => {
+    if (r.success) return;
+    const code = r.error?.code || "";
+    if (
+      code === "messaging/registration-token-not-registered" ||
+      code === "messaging/invalid-registration-token"
+    ) {
+      dead.push(tokens[idx]);
+    }
+  });
+
+  if (dead.length) {
+    await pool.query(
+      `DELETE FROM push_tokens WHERE user_id = $1 AND token = ANY($2::text[])`,
+      [toUserId, dead]
+    );
+  }
+}
+
 
 // -------------------- DB: triggers for NOTIFY --------------------
 async function ensureNotifyTriggers(client) {
@@ -167,6 +247,12 @@ async function initDbForever() {
       `);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_messages_conv_id_desc ON dm_messages(conversation_id, id DESC);`);
 
+      // ✅ для unread_count
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_dm_messages_conv_sender_id_desc
+        ON dm_messages(conversation_id, sender_user_id, id DESC);
+      `);
+
       await client.query(`
         CREATE TABLE IF NOT EXISTS dm_contacts (
           owner_user_id INTEGER NOT NULL,
@@ -205,6 +291,18 @@ async function initDbForever() {
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
       `);
+
+      // ✅ PUSH TOKENS (миграция)
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS push_tokens (
+          user_id INTEGER NOT NULL,
+          token TEXT NOT NULL,
+          platform TEXT NOT NULL DEFAULT 'android' CHECK (platform IN ('android')),
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (user_id, token)
+        );
+      `);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(user_id);`);
 
       await ensureNotifyTriggers(client);
 
@@ -275,6 +373,7 @@ async function onlineBatch(ids) {
 
 // -------------------- SSE + Postgres LISTEN/NOTIFY --------------------
 const sseClients = new Map(); // userId -> Set<{res, scope}>
+
 function addSseClient(userId, res, scope) {
   const uid = Number(userId);
   if (!sseClients.has(uid)) sseClients.set(uid, new Set());
@@ -282,6 +381,7 @@ function addSseClient(userId, res, scope) {
   sseClients.get(uid).add(entry);
   return entry;
 }
+
 function removeSseClient(userId, entry) {
   const uid = Number(userId);
   const set = sseClients.get(uid);
@@ -289,11 +389,13 @@ function removeSseClient(userId, entry) {
   set.delete(entry);
   if (set.size === 0) sseClients.delete(uid);
 }
+
 function sseSend(res, event, obj) {
   const data = JSON.stringify(obj);
   res.write(`event: ${event}\n`);
   res.write(`data: ${data}\n\n`);
 }
+
 function safeJson(s) {
   try {
     return JSON.parse(s);
@@ -301,6 +403,7 @@ function safeJson(s) {
     return { raw: s };
   }
 }
+
 function broadcastToUser(uid, event, payload, scopeFilterFn = null) {
   const set = sseClients.get(Number(uid));
   if (!set) return;
@@ -324,7 +427,6 @@ async function startSubscriber() {
       }
     });
 
-    // ✅ FIX: safe dm handler (no async emitter callback + try/catch)
     subscriber.notifications.on("dm_messages", (payload) => {
       (async () => {
         try {
@@ -332,24 +434,17 @@ async function startSubscriber() {
           const convId = obj?.conversation_id;
           if (!convId) return;
 
-          console.log("📩 NOTIFY dm_messages:", obj);
-
           const r = await pool.query(
             "SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1",
             [convId]
           );
-          if (!r.rows.length) {
-            console.warn("⚠️ dm_pairs not found for conv:", convId);
-            return;
-          }
+          if (!r.rows.length) return;
 
           const { user_low, user_high } = r.rows[0];
-          console.log("➡️ broadcast dm_message to:", user_low, user_high, "conv:", convId);
 
           broadcastToUser(user_low, "dm_message", obj, (scope) => scope === "dm" || scope === `dm:${convId}`);
           broadcastToUser(user_high, "dm_message", obj, (scope) => scope === "dm" || scope === `dm:${convId}`);
         } catch (e) {
-          // без этого ошибки превращаются в unhandled rejection и ломают реальный тайм
           console.error("❌ dm_messages handler failed:", e?.message || e);
         }
       })();
@@ -377,7 +472,7 @@ app.get("/events", authenticateToken, async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no"); // полезно, если появится proxy/nginx
+  res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
 
   await touchPresence(req.user.uid);
@@ -401,6 +496,28 @@ app.get("/events", authenticateToken, async (req, res) => {
 // -------------------- BASIC ROUTES --------------------
 app.get("/ping", (req, res) => {
   res.json({ status: "ok", message: "pong", service: "game-mail-service", server_time: new Date().toISOString() });
+});
+
+// -------------------- PUSH: register token --------------------
+app.post("/push/register", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
+  const token = (req.body?.token || "").toString().trim();
+  if (!token) return res.status(400).json({ error: "token required" });
+  if (token.length > 4096) return res.status(400).json({ error: "token too long" });
+
+  try {
+    await pool.query(
+      `INSERT INTO push_tokens (user_id, token, platform, updated_at)
+       VALUES ($1, $2, 'android', CURRENT_TIMESTAMP)
+       ON CONFLICT (user_id, token)
+       DO UPDATE SET updated_at = CURRENT_TIMESTAMP`,
+      [req.user.uid, token]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: "Database error" });
+  }
 });
 
 // -------------------- Presence endpoints --------------------
@@ -504,7 +621,6 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
       [me.id, me.nickname, body]
     );
 
-    // keep last 100
     await pool.query(`
       DELETE FROM global_messages
       WHERE id NOT IN (
@@ -525,12 +641,13 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
   }
 });
 
-// отметить “прочитано” global до id
 app.post("/chat/global/read", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
   const last_read_id = Number(req.body?.last_read_id);
-  if (!Number.isInteger(last_read_id) || last_read_id < 0) return res.status(400).json({ error: "last_read_id must be integer >= 0" });
+  if (!Number.isInteger(last_read_id) || last_read_id < 0) {
+    return res.status(400).json({ error: "last_read_id must be integer >= 0" });
+  }
 
   try {
     await pool.query(
@@ -739,7 +856,7 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
 
     await client.query("COMMIT");
 
-    // ✅ PUSH DM EVENT IMMEDIATELY (без ожидания LISTEN/NOTIFY)
+    // SSE: сразу
     const ssePayload = {
       id: msgId,
       conversation_id: conversationId,
@@ -748,9 +865,28 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
       created_at: createdAt,
     };
 
-    // обоим участникам (и тем кто слушает общий dm, и тем кто слушает конкретный dm:<convId>)
     broadcastToUser(user_low, "dm_message", ssePayload, (scope) => scope === "dm" || scope === `dm:${conversationId}`);
     broadcastToUser(user_high, "dm_message", ssePayload, (scope) => scope === "dm" || scope === `dm:${conversationId}`);
+
+    // ✅ PUSH: только получателю и только если оффлайн по presence
+    try {
+      const receiverId = otherId;
+      const receiverOnline = await isOnline(receiverId);
+      if (!receiverOnline) {
+        await sendDmPush(receiverId, {
+          title: `Сообщение от ${me.rows[0].nickname}`,
+          body: body.length > 120 ? body.slice(0, 120) + "…" : body,
+          data: {
+            type: "dm",
+            conversation_id: conversationId,
+            sender_user_id: req.user.uid,
+            sender_nickname: me.rows[0].nickname,
+          },
+        });
+      }
+    } catch (e) {
+      console.warn("⚠️ sendDmPush failed:", e?.message || e);
+    }
 
     res.status(201).json({
       message: "sent",
@@ -772,13 +908,26 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
   }
 });
 
-// DM contacts list
+// DM contacts list (✅ unread_count)
 app.get("/chat/contacts", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
   try {
     const r = await pool.query(
-      `SELECT c.contact_user_id, c.conversation_id, c.last_message_id, c.last_read_message_id, c.last_at, u.nickname
+      `SELECT
+         c.contact_user_id,
+         c.conversation_id,
+         c.last_message_id,
+         c.last_read_message_id,
+         c.last_at,
+         u.nickname,
+         (
+           SELECT COUNT(*)::int
+           FROM dm_messages m
+           WHERE m.conversation_id = c.conversation_id
+             AND m.sender_user_id = c.contact_user_id
+             AND m.id > COALESCE(c.last_read_message_id, 0)
+         ) AS unread_count
        FROM dm_contacts c
        JOIN users u ON u.id = c.contact_user_id
        WHERE c.owner_user_id = $1
@@ -796,6 +945,7 @@ app.get("/chat/contacts", authenticateToken, async (req, res) => {
         last_message_id: x.last_message_id,
         last_read_message_id: x.last_read_message_id,
         last_at: x.last_at,
+        unread_count: x.unread_count || 0,
       })),
     });
   } catch (e) {
@@ -842,16 +992,24 @@ app.post("/chat/dm/:conversation_id/read", authenticateToken, async (req, res) =
   }
 });
 
-// -------------------- NOTIFICATIONS SUMMARY --------------------
+// -------------------- NOTIFICATIONS SUMMARY (threads + messages) --------------------
 app.get("/notifications/summary", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
   try {
     const dm = await pool.query(
-      `SELECT COUNT(*)::int AS cnt
-       FROM dm_contacts
-       WHERE owner_user_id = $1
-         AND COALESCE(last_message_id, 0) > COALESCE(last_read_message_id, 0)`,
+      `SELECT
+         COUNT(*) FILTER (WHERE u.unread_count > 0)::int AS dm_unread_threads,
+         COALESCE(SUM(u.unread_count), 0)::int AS dm_unread_messages
+       FROM dm_contacts c
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*)::int AS unread_count
+         FROM dm_messages m
+         WHERE m.conversation_id = c.conversation_id
+           AND m.sender_user_id = c.contact_user_id
+           AND m.id > COALESCE(c.last_read_message_id, 0)
+       ) u ON true
+       WHERE c.owner_user_id = $1`,
       [req.user.uid]
     );
 
@@ -859,11 +1017,11 @@ app.get("/notifications/summary", authenticateToken, async (req, res) => {
     const lastRead = gr.rows.length ? Number(gr.rows[0].last_read_id) : 0;
 
     const g = await pool.query(`SELECT COUNT(*)::int AS cnt FROM global_messages WHERE id > $1`, [lastRead]);
-
     const m = await pool.query(`SELECT COUNT(*)::int AS cnt FROM mails WHERE to_user_id = $1 AND status = 'unread'`, [req.user.uid]);
 
     res.json({
-      dm_unread: dm.rows[0].cnt,
+      dm_unread_threads: dm.rows[0]?.dm_unread_threads ?? 0,
+      dm_unread_messages: dm.rows[0]?.dm_unread_messages ?? 0,
       global_unread: g.rows[0].cnt,
       mail_unread: m.rows[0].cnt,
     });
@@ -872,7 +1030,7 @@ app.get("/notifications/summary", authenticateToken, async (req, res) => {
   }
 });
 
-// -------------------- MAIL --------------------
+// -------------------- MAIL (как было) --------------------
 app.get("/mail/inbox", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -1039,9 +1197,7 @@ app.post("/admin/mail/send", requireAdmin, async (req, res) => {
 
 // -------------------- START --------------------
 async function main() {
-  // init DB (with retries)
   await initDbForever();
-
   app.listen(PORT, () => console.log(`🚀 game-mail-service on port ${PORT}`));
 }
 
