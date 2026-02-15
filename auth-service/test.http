@@ -1,53 +1,150 @@
-# --- CONFIG ---
+# =========================
+# AUTH SERVICE test.http
+# =========================
+
 @baseUrl = http://localhost:3000
+@adminKey = put-your-admin-key-here
 
-### 0) Ping
+# тестовые креды
+@login = test_user
+@nickname = Тестер
+@password = 1234
+
+# -------------------------
+# 0) Ping
+# -------------------------
+###
 GET {{baseUrl}}/ping
+Accept: application/json
 
-### 1) Проверить логин (доступность)
+# -------------------------
+# VERSION / UPDATE
+# -------------------------
+###
+GET {{baseUrl}}/app/latest
+Accept: application/json
+
+###
+POST {{baseUrl}}/app/check-version
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version_code": 1,
+  "version_name": "1.0.0"
+}
+
+###
+# binary download (если game.apk отсутствует — будет 404 json)
+GET {{baseUrl}}/app/download-apk
+
+# -------------------------
+# AUTH / USERS
+# -------------------------
+###
 POST {{baseUrl}}/user/check-login
 Content-Type: application/json
+Accept: application/json
 
 {
-  "login": "cat_cultivator_1"
+  "login": "{{login}}"
 }
 
-### 2) Регистрация нового кота-культиватора
+###
 POST {{baseUrl}}/register
 Content-Type: application/json
+Accept: application/json
 
 {
-  "login": "cat_cultivator_1",
-  "nickname": "Кот-1",
-  "password": "paws_password_123"
+  "login": "{{login}}",
+  "nickname": "{{nickname}}",
+  "password": "{{password}}"
 }
 
-### 3) Логин -> получаем access_token
-# @name login
+###
+# @name loginReq
 POST {{baseUrl}}/login
 Content-Type: application/json
+Accept: application/json
 
 {
-  "login": "cat_cultivator_1",
-  "password": "paws_password_123"
+  "login": "{{login}}",
+  "password": "{{password}}"
 }
 
-### 4) Достаём токен из ответа логина (JSONPath)
-@authToken = {{login.response.body.$.access_token}}
+# REST Client request variables from previous response (JSONPath)
+# syntax: {{requestName.response.body.<jsonpath>}} :contentReference[oaicite:1]{index=1}
+@access_token = {{loginReq.response.body.$.access_token}}
+@refresh_token = {{loginReq.response.body.$.refresh_token}}
 
-### 5) Получить статы (авторизация)
-GET {{baseUrl}}/cat-stats
-Authorization: Bearer {{authToken}}
-
-### 6) Дата регистрации по логину
-GET {{baseUrl}}/user/reg-date/cat_cultivator_1
-
-### 7) Refresh (обновить access_token)
-@refreshToken = {{login.response.body.$.refresh_token}}
-
+###
 POST {{baseUrl}}/refresh
 Content-Type: application/json
+Accept: application/json
 
 {
-  "refresh_token": "{{refreshToken}}"
+  "refresh_token": "{{refresh_token}}"
+}
+
+# можно обновить access токен из ответа refresh (если запускаешь refresh запрос)
+# @name refreshReq
+@access_token = {{refreshReq.response.body.$.access_token}}
+
+###
+GET {{baseUrl}}/user/reg-date/{{login}}
+Accept: application/json
+
+# -------------------------
+# STATS (auth)
+# -------------------------
+###
+GET {{baseUrl}}/cat-stats
+Accept: application/json
+Authorization: Bearer {{access_token}}
+
+# -------------------------
+# AVATARS (auth)
+# -------------------------
+###
+GET {{baseUrl}}/users/1/avatar
+Accept: application/json
+Authorization: Bearer {{access_token}}
+
+###
+GET {{baseUrl}}/avatars/my
+Accept: application/json
+Authorization: Bearer {{access_token}}
+
+###
+POST {{baseUrl}}/avatars/add
+Content-Type: application/json
+Accept: application/json
+Authorization: Bearer {{access_token}}
+
+{
+  "avatar": "cat_01"
+}
+
+###
+POST {{baseUrl}}/avatars/select
+Content-Type: application/json
+Accept: application/json
+Authorization: Bearer {{access_token}}
+
+{
+  "avatar": "cat_01"
+}
+
+# -------------------------
+# ADMIN (optional)
+# -------------------------
+###
+POST {{baseUrl}}/admin/avatars/upsert
+Content-Type: application/json
+Accept: application/json
+x-admin-key: {{adminKey}}
+
+{
+  "code": "cat_01",
+  "title": "Кот №1"
 }

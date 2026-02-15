@@ -1,21 +1,23 @@
-// game-mail-service/env.js
-const fs = require("fs");
+'use strict';
 
-function readEnv(name, required = true) {
-  const fileKey = `${name}_FILE`;
-
-  if (process.env[fileKey]) {
-    const p = process.env[fileKey];
-    const v = fs.readFileSync(p, "utf8").trim();
-    if (!v && required) throw new Error(`${fileKey} is empty`);
-    return v;
-  }
+function readEnv(name, opts = {}) {
+  const required = opts.required !== false;
+  const allowEmpty = opts.allowEmpty === true;
 
   const v = process.env[name];
-  if ((!v || !String(v).trim()) && required) {
-    throw new Error(`Missing env var: ${name} (or ${fileKey})`);
+
+  if (v === undefined || v === null) {
+    if (required) throw new Error(`Missing env var: ${name}`);
+    return '';
   }
-  return v;
+
+  const s = String(v);
+
+  if (required && !allowEmpty && s.trim() === '') {
+    throw new Error(`Empty env var: ${name}`);
+  }
+
+  return s;
 }
 
 module.exports = { readEnv };
