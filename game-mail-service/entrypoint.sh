@@ -42,7 +42,6 @@ if [ -n "$REFRESH_SECRET" ]; then export REFRESH_SECRET; fi
 if [ -n "$ADMIN_SECRET_KEY" ]; then export ADMIN_SECRET_KEY; fi
 if [ -n "$FIREBASE_SERVICE_ACCOUNT_JSON" ]; then export FIREBASE_SERVICE_ACCOUNT_JSON; fi
 
-# ✅ если CMD/command не передали — запускаем node server.js
 if [ "$#" -eq 0 ]; then
   set -- node server.js
 fi

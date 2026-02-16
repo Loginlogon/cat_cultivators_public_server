@@ -36,13 +36,7 @@ function shouldLog(level) {
 }
 function log(level, msg, meta) {
   if (!shouldLog(level)) return;
-  const out = {
-    t: new Date().toISOString(),
-    level,
-    msg,
-    meta: meta || undefined,
-  };
-  // eslint-disable-next-line no-console
+  const out = { t: new Date().toISOString(), level, msg, meta: meta || undefined };
   console.log(JSON.stringify(out));
 }
 
@@ -64,10 +58,7 @@ const pool = new Pool({ connectionString: DATABASE_URL });
 pool.on("error", (err) => log("error", "pg.pool.error", { err: err?.message || String(err) }));
 
 // -------------------- REDIS (presence) --------------------
-const redis = new Redis(REDIS_URL, {
-  enableAutoPipelining: false,
-  lazyConnect: true,
-});
+const redis = new Redis(REDIS_URL, { enableAutoPipelining: false, lazyConnect: true });
 redis.on("error", (e) => log("error", "redis.error", { err: e?.message || String(e) }));
 
 let redisConnectPromise = null;
@@ -122,13 +113,11 @@ async function onlineBatch(ids) {
   const pipe = redis.pipeline();
   for (const id of unique) pipe.get(presenceKey(id));
   const results = await pipe.exec();
-
   return unique.map((id, idx) => ({ user_id: id, online: results[idx]?.[1] !== null }));
 }
 
 // -------------------- HELPERS --------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 const clampInt = (v, def, min, max) => {
   const n = Number.isFinite(Number(v)) ? Number(v) : def;
   return Math.max(min, Math.min(max, Math.trunc(n)));
@@ -187,9 +176,7 @@ function initFirebaseOnce() {
 
   try {
     const serviceAccount = JSON.parse(json);
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     firebaseReady = true;
     log("info", "firebase.ready");
     return true;
@@ -212,12 +199,7 @@ async function sendDmPush(toUserId, { title, body, data }) {
     return;
   }
 
-  const payloadData = {
-    ...(data || {}),
-    type: "dm",
-    title: String(title || ""),
-    body: String(body || ""),
-  };
+  const payloadData = { ...(data || {}), type: "dm", title: String(title || ""), body: String(body || "") };
 
   log("debug", "push.send.start", { toUserId, tokens: tokens.length });
 
@@ -231,19 +213,13 @@ async function sendDmPush(toUserId, { title, body, data }) {
   resp.responses.forEach((r, idx) => {
     if (r.success) return;
     const code = r.error?.code || "";
-    if (
-      code === "messaging/registration-token-not-registered" ||
-      code === "messaging/invalid-registration-token"
-    ) {
+    if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
       dead.push(tokens[idx]);
     }
   });
 
   if (dead.length) {
-    await pool.query(
-      `DELETE FROM push_tokens WHERE user_id = $1 AND token = ANY($2::text[])`,
-      [toUserId, dead]
-    );
+    await pool.query(`DELETE FROM push_tokens WHERE user_id = $1 AND token = ANY($2::text[])`, [toUserId, dead]);
     log("warn", "push.tokens.cleaned", { toUserId, dead: dead.length });
   }
 
@@ -251,9 +227,6 @@ async function sendDmPush(toUserId, { title, body, data }) {
 }
 
 // -------------------- SSE --------------------
-// ВАЖНО: отправляем без `event:` чтобы клиент, который слушает только default "message", тоже работал.
-// Тип события кладём в JSON: { type: "global_message" | "dm_message" | ... }
-
 const sseClients = new Map(); // userId -> Set<entry>
 let sseConnSeq = 0;
 
@@ -275,26 +248,17 @@ function removeSseClient(userId, entry, reason) {
   log("info", "sse.client.remove", { uid, scope: entry.scope, connId: entry.connId, reason: reason || "unknown" });
 }
 
-// SSE frame (без event:)
 function sseSend(res, obj, id = null) {
   const data = JSON.stringify(obj);
   if (id !== null && id !== undefined) res.write(`id: ${String(id)}\n`);
   res.write(`data: ${data}\n\n`);
 }
-
 function sseComment(res, text) {
-  // Комментарии начинаются с ":" — удобно как keep-alive. :contentReference[oaicite:1]{index=1}
   res.write(`: ${text}\n\n`);
 }
-
 function safeJson(s) {
-  try {
-    return JSON.parse(s);
-  } catch (_) {
-    return { raw: s };
-  }
+  try { return JSON.parse(s); } catch (_) { return { raw: s }; }
 }
-
 function broadcastToUser(uid, payload, scopeFilterFn = null, id = null) {
   const set = sseClients.get(Number(uid));
   if (!set) return 0;
@@ -305,7 +269,6 @@ function broadcastToUser(uid, payload, scopeFilterFn = null, id = null) {
       sseSend(entry.res, payload, id);
       sent++;
     } catch (e) {
-      // если клиент отвалился — убираем
       try { entry.res.end(); } catch (_) {}
       removeSseClient(uid, entry, "write_failed");
     }
@@ -313,14 +276,12 @@ function broadcastToUser(uid, payload, scopeFilterFn = null, id = null) {
   return sent;
 }
 
-// -------------------- DEDUPE (direct + NOTIFY) --------------------
+// -------------------- DEDUPE --------------------
 const RECENT_TTL_MS = Number(process.env.RECENT_TTL_MS || 10000);
-const recentGlobal = new Map(); // id -> ts
-const recentDm = new Map();     // id -> ts
+const recentGlobal = new Map();
+const recentDm = new Map();
 
-function markRecent(map, key) {
-  map.set(String(key), Date.now());
-}
+function markRecent(map, key) { map.set(String(key), Date.now()); }
 function wasRecent(map, key) {
   const k = String(key);
   const ts = map.get(k);
@@ -337,7 +298,6 @@ setInterval(() => {
 
 // -------------------- DB: triggers for NOTIFY --------------------
 async function ensureNotifyTriggers(client) {
-  // ✅ ДОБАВИЛИ body в payload (это критично для обновления чата)
   await client.query(`
     CREATE OR REPLACE FUNCTION notify_global_message() RETURNS trigger AS $$
     BEGIN
@@ -348,7 +308,8 @@ async function ensureNotifyTriggers(client) {
           'user_id', NEW.user_id,
           'nickname', NEW.nickname,
           'body', NEW.body,
-          'created_at', NEW.created_at
+          'created_at', NEW.created_at,
+          'reply_to_id', NEW.reply_to_id
         )::text
       );
       RETURN NEW;
@@ -356,7 +317,6 @@ async function ensureNotifyTriggers(client) {
     $$ LANGUAGE plpgsql;
   `);
 
-  // ✅ ДОБАВИЛИ body в payload (это критично для DM)
   await client.query(`
     CREATE OR REPLACE FUNCTION notify_dm_message() RETURNS trigger AS $$
     BEGIN
@@ -368,7 +328,8 @@ async function ensureNotifyTriggers(client) {
           'sender_user_id', NEW.sender_user_id,
           'sender_nickname', NEW.sender_nickname,
           'body', NEW.body,
-          'created_at', NEW.created_at
+          'created_at', NEW.created_at,
+          'reply_to_id', NEW.reply_to_id
         )::text
       );
       RETURN NEW;
@@ -411,7 +372,9 @@ async function initDbForever() {
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
       `);
+      await client.query(`ALTER TABLE global_messages ADD COLUMN IF NOT EXISTS reply_to_id BIGINT;`);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_global_messages_id_desc ON global_messages(id DESC);`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_global_messages_reply_to ON global_messages(reply_to_id);`);
 
       await client.query(`
         CREATE TABLE IF NOT EXISTS conversations (
@@ -441,7 +404,9 @@ async function initDbForever() {
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
       `);
+      await client.query(`ALTER TABLE dm_messages ADD COLUMN IF NOT EXISTS reply_to_id BIGINT;`);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_messages_conv_id_desc ON dm_messages(conversation_id, id DESC);`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_messages_reply_to ON dm_messages(conversation_id, reply_to_id);`);
       await client.query(`
         CREATE INDEX IF NOT EXISTS idx_dm_messages_conv_sender_id_desc
         ON dm_messages(conversation_id, sender_user_id, id DESC);
@@ -497,6 +462,29 @@ async function initDbForever() {
       `);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(user_id);`);
 
+      // reactions
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS global_reactions (
+          message_id BIGINT NOT NULL,
+          user_id INTEGER NOT NULL,
+          reaction SMALLINT NOT NULL CHECK (reaction IN (-1, 1)),
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (message_id, user_id)
+        );
+      `);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_global_reactions_msg ON global_reactions(message_id);`);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS dm_reactions (
+          message_id BIGINT NOT NULL,
+          user_id INTEGER NOT NULL,
+          reaction SMALLINT NOT NULL CHECK (reaction IN (-1, 1)),
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (message_id, user_id)
+        );
+      `);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_reactions_msg ON dm_reactions(message_id);`);
+
       await ensureNotifyTriggers(client);
 
       await client.query("COMMIT");
@@ -531,12 +519,10 @@ app.get("/events", authenticateToken, async (req, res) => {
 
   await touchPresence(req.user.uid);
 
-  // retry — если клиент отвалился, пусть пытается переподключаться
   try { res.write(`retry: 3000\n\n`); } catch (_) {}
 
   const entry = addSseClient(req.user.uid, res, scope);
 
-  // hello (без event:, type внутри JSON)
   sseSend(res, {
     type: "hello",
     ok: true,
@@ -545,7 +531,6 @@ app.get("/events", authenticateToken, async (req, res) => {
     instance: INSTANCE,
   });
 
-  // keep-alive
   const ka = setInterval(async () => {
     try {
       sseComment(res, `keepalive ${Date.now()}`);
@@ -590,9 +575,7 @@ app.post("/push/register", authenticateToken, async (req, res) => {
 app.post("/presence/offline", authenticateToken, async (req, res) => {
   try {
     const ok = await ensureRedisConnected();
-    if (ok && redis.status === "ready") {
-      await redis.del(presenceKey(req.user.uid));
-    }
+    if (ok && redis.status === "ready") await redis.del(presenceKey(req.user.uid));
   } catch (_) {}
   res.json({ ok: true });
 });
@@ -609,7 +592,6 @@ app.get("/presence/online/:userId", authenticateToken, async (req, res) => {
 
 app.get("/presence/online-batch", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
-
   const ids = (req.query.ids || "").toString().split(",").map((x) => Number(x.trim()));
   const online = await onlineBatch(ids);
   res.json({ online });
@@ -644,7 +626,7 @@ app.get("/users/search", authenticateToken, async (req, res) => {
   }
 });
 
-// -------------------- GLOBAL CHAT --------------------
+// -------------------- GLOBAL CHAT HISTORY (reply + reactions + my_reaction) --------------------
 app.get("/chat/global/history", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -652,24 +634,70 @@ app.get("/chat/global/history", authenticateToken, async (req, res) => {
   const beforeId = req.query.before_id ? Number(req.query.before_id) : null;
 
   try {
-    const q = beforeId
-      ? `SELECT id, user_id, nickname, body, created_at
-         FROM global_messages
-         WHERE id < $1
-         ORDER BY id DESC
-         LIMIT $2`
-      : `SELECT id, user_id, nickname, body, created_at
-         FROM global_messages
-         ORDER BY id DESC
-         LIMIT $1`;
+    const params = [];
+    let where = "";
+    if (beforeId) { where = "WHERE m.id < $1"; params.push(beforeId); }
+    params.push(limit);
+    const uidParamIndex = params.length + 1;
+    params.push(req.user.uid);
 
-    const params = beforeId ? [beforeId, limit] : [limit];
+    const q = `
+      WITH base AS (
+        SELECT m.*
+        FROM global_messages m
+        ${where}
+        ORDER BY m.id DESC
+        LIMIT $${beforeId ? 2 : 1}
+      ),
+      react AS (
+        SELECT
+          r.message_id,
+          COUNT(*) FILTER (WHERE r.reaction = 1)::int  AS like_count,
+          COUNT(*) FILTER (WHERE r.reaction = -1)::int AS dislike_count
+        FROM global_reactions r
+        WHERE r.message_id IN (SELECT id FROM base)
+        GROUP BY r.message_id
+      ),
+      my AS (
+        SELECT r.message_id, r.reaction
+        FROM global_reactions r
+        WHERE r.user_id = $${uidParamIndex}
+          AND r.message_id IN (SELECT id FROM base)
+      )
+      SELECT
+        m.id, m.user_id, m.nickname, m.body, m.created_at, m.reply_to_id,
+        COALESCE(react.like_count, 0)    AS like_count,
+        COALESCE(react.dislike_count, 0) AS dislike_count,
+        COALESCE(my.reaction, 0)         AS my_reaction,
+
+        rt.id         AS reply_id,
+        rt.user_id    AS reply_user_id,
+        rt.nickname   AS reply_nickname,
+        rt.body       AS reply_body,
+        rt.created_at AS reply_created_at
+
+      FROM base m
+      LEFT JOIN global_messages rt ON rt.id = m.reply_to_id
+      LEFT JOIN react ON react.message_id = m.id
+      LEFT JOIN my    ON my.message_id    = m.id
+      ORDER BY m.id ASC
+    `;
+
     const r = await pool.query(q, params);
 
-    const items = r.rows.reverse().map((m) => ({
+    const items = r.rows.map((m) => ({
       id: m.id,
       body: m.body,
       created_at: m.created_at,
+      like_count: m.like_count || 0,
+      dislike_count: m.dislike_count || 0,
+      my_reaction: m.my_reaction || 0,
+      reply_to: m.reply_id ? {
+        id: m.reply_id,
+        body: m.reply_body,
+        created_at: m.reply_created_at,
+        sender: { user_id: m.reply_user_id, nickname: m.reply_nickname, header: `${m.reply_nickname}#${m.reply_user_id}` },
+      } : null,
       sender: { user_id: m.user_id, nickname: m.nickname, header: `${m.nickname}#${m.user_id}` },
     }));
 
@@ -681,36 +709,49 @@ app.get("/chat/global/history", authenticateToken, async (req, res) => {
   }
 });
 
+// -------------------- GLOBAL SEND (reply_to_id) --------------------
 app.post("/chat/global/send", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
   const body = (req.body?.body || "").toString();
+  const replyToRaw = req.body?.reply_to_id;
+  const reply_to_id = replyToRaw === null || replyToRaw === undefined || replyToRaw === "" ? null : Number(replyToRaw);
+
   if (!body.trim()) return res.status(400).json({ error: "Message body required" });
   if (body.length > 1024) return res.status(400).json({ error: "Message too long (max 1024)" });
+  if (reply_to_id !== null && (!Number.isInteger(reply_to_id) || reply_to_id <= 0)) {
+    return res.status(400).json({ error: "reply_to_id must be positive integer or null" });
+  }
 
   try {
     const me = await getUserBasic(req.user.uid);
     if (!me) return res.status(401).json({ error: "User not found" });
 
+    if (reply_to_id !== null) {
+      const chk = await pool.query(`SELECT 1 FROM global_messages WHERE id = $1 LIMIT 1`, [reply_to_id]);
+      if (!chk.rows.length) return res.status(400).json({ error: "reply_to_id not found" });
+    }
+
     const insert = await pool.query(
-      `INSERT INTO global_messages (user_id, nickname, body)
-       VALUES ($1, $2, $3)
+      `INSERT INTO global_messages (user_id, nickname, body, reply_to_id)
+       VALUES ($1, $2, $3, $4)
        RETURNING id, created_at`,
-      [me.id, me.nickname, body]
+      [me.id, me.nickname, body, reply_to_id]
     );
 
     // чистка до 100
     await pool.query(`
       DELETE FROM global_messages
-      WHERE id NOT IN (
-        SELECT id FROM global_messages ORDER BY id DESC LIMIT 100
-      )
+      WHERE id NOT IN (SELECT id FROM global_messages ORDER BY id DESC LIMIT 100)
+    `);
+    await pool.query(`
+      DELETE FROM global_reactions r
+      WHERE NOT EXISTS (SELECT 1 FROM global_messages m WHERE m.id = r.message_id)
     `);
 
     const msgId = insert.rows[0].id;
     const createdAt = insert.rows[0].created_at;
 
-    // ✅ direct broadcast (и дедуп на случай, если прилетит NOTIFY)
     const payload = {
       type: "global_message",
       id: msgId,
@@ -718,19 +759,18 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
       nickname: me.nickname,
       body,
       created_at: createdAt,
+      reply_to_id,
       instance: INSTANCE,
       source: "direct",
     };
 
     markRecent(recentGlobal, msgId);
+
     let sent = 0;
     for (const [, set] of sseClients.entries()) {
       for (const entry of set) {
         if (entry.scope === "global") {
-          try {
-            sseSend(entry.res, payload, msgId);
-            sent++;
-          } catch (_) {}
+          try { sseSend(entry.res, payload, msgId); sent++; } catch (_) {}
         }
       }
     }
@@ -738,11 +778,7 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
 
     res.status(201).json({
       message: "sent",
-      data: {
-        id: msgId,
-        created_at: createdAt,
-        sender: { user_id: me.id, nickname: me.nickname, header: `${me.nickname}#${me.id}` },
-      },
+      data: { id: msgId, created_at: createdAt, sender: { user_id: me.id, nickname: me.nickname, header: `${me.nickname}#${me.id}` } },
     });
   } catch (e) {
     log("error", "global.send.failed", { err: e?.message || String(e) });
@@ -750,6 +786,7 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
   }
 });
 
+// -------------------- GLOBAL READ --------------------
 app.post("/chat/global/read", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -771,6 +808,39 @@ app.post("/chat/global/read", authenticateToken, async (req, res) => {
     res.json({ ok: true, last_read_id });
   } catch (e) {
     log("error", "global.read.failed", { err: e?.message || String(e) });
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// -------------------- GLOBAL REACT --------------------
+app.post("/chat/global/:message_id/react", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
+  const messageId = Number(req.params.message_id);
+  const reaction = Number(req.body?.reaction);
+
+  if (!Number.isInteger(messageId) || messageId <= 0) return res.status(400).json({ error: "bad message_id" });
+  if (![-1, 0, 1].includes(reaction)) return res.status(400).json({ error: "reaction must be -1, 0 or 1" });
+
+  try {
+    const chk = await pool.query(`SELECT 1 FROM global_messages WHERE id = $1 LIMIT 1`, [messageId]);
+    if (!chk.rows.length) return res.status(404).json({ error: "message not found" });
+
+    if (reaction === 0) {
+      await pool.query(`DELETE FROM global_reactions WHERE message_id = $1 AND user_id = $2`, [messageId, req.user.uid]);
+    } else {
+      await pool.query(
+        `INSERT INTO global_reactions (message_id, user_id, reaction, updated_at)
+         VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+         ON CONFLICT (message_id, user_id)
+         DO UPDATE SET reaction = EXCLUDED.reaction, updated_at = CURRENT_TIMESTAMP`,
+        [messageId, req.user.uid, reaction]
+      );
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    log("error", "global.react.failed", { err: e?.message || String(e), messageId });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -849,6 +919,7 @@ app.post("/chat/dm/start", authenticateToken, async (req, res) => {
   }
 });
 
+// -------------------- DM HISTORY (reply + reactions + my_reaction) --------------------
 app.get("/chat/dm/:conversation_id/history", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -867,25 +938,71 @@ app.get("/chat/dm/:conversation_id/history", authenticateToken, async (req, res)
     );
     if (member.rows.length === 0) return res.status(403).json({ error: "Not a member of this conversation" });
 
-    const q = beforeId
-      ? `SELECT id, sender_user_id, sender_nickname, body, created_at
-         FROM dm_messages
-         WHERE conversation_id = $1 AND id < $2
-         ORDER BY id DESC
-         LIMIT $3`
-      : `SELECT id, sender_user_id, sender_nickname, body, created_at
-         FROM dm_messages
-         WHERE conversation_id = $1
-         ORDER BY id DESC
-         LIMIT $2`;
+    const params = [conversationId];
+    let beforeWhere = "";
+    if (beforeId) { beforeWhere = "AND m.id < $2"; params.push(beforeId); params.push(limit); }
+    else { params.push(limit); }
+    const uidParamIndex = params.length + 1;
+    params.push(req.user.uid);
 
-    const params = beforeId ? [conversationId, beforeId, limit] : [conversationId, limit];
+    const q = `
+      WITH base AS (
+        SELECT m.*
+        FROM dm_messages m
+        WHERE m.conversation_id = $1
+        ${beforeWhere}
+        ORDER BY m.id DESC
+        LIMIT $${beforeId ? 3 : 2}
+      ),
+      react AS (
+        SELECT
+          r.message_id,
+          COUNT(*) FILTER (WHERE r.reaction = 1)::int  AS like_count,
+          COUNT(*) FILTER (WHERE r.reaction = -1)::int AS dislike_count
+        FROM dm_reactions r
+        WHERE r.message_id IN (SELECT id FROM base)
+        GROUP BY r.message_id
+      ),
+      my AS (
+        SELECT r.message_id, r.reaction
+        FROM dm_reactions r
+        WHERE r.user_id = $${uidParamIndex}
+          AND r.message_id IN (SELECT id FROM base)
+      )
+      SELECT
+        m.id, m.sender_user_id, m.sender_nickname, m.body, m.created_at, m.reply_to_id,
+        COALESCE(react.like_count, 0)    AS like_count,
+        COALESCE(react.dislike_count, 0) AS dislike_count,
+        COALESCE(my.reaction, 0)         AS my_reaction,
+
+        rt.id               AS reply_id,
+        rt.sender_user_id   AS reply_user_id,
+        rt.sender_nickname  AS reply_nickname,
+        rt.body             AS reply_body,
+        rt.created_at       AS reply_created_at
+
+      FROM base m
+      LEFT JOIN dm_messages rt ON rt.id = m.reply_to_id
+      LEFT JOIN react ON react.message_id = m.id
+      LEFT JOIN my    ON my.message_id    = m.id
+      ORDER BY m.id ASC
+    `;
+
     const r = await pool.query(q, params);
 
-    const items = r.rows.reverse().map((m) => ({
+    const items = r.rows.map((m) => ({
       id: m.id,
       body: m.body,
       created_at: m.created_at,
+      like_count: m.like_count || 0,
+      dislike_count: m.dislike_count || 0,
+      my_reaction: m.my_reaction || 0,
+      reply_to: m.reply_id ? {
+        id: m.reply_id,
+        body: m.reply_body,
+        created_at: m.reply_created_at,
+        sender: { user_id: m.reply_user_id, nickname: m.reply_nickname, header: `${m.reply_nickname}#${m.reply_user_id}` },
+      } : null,
       sender: { user_id: m.sender_user_id, nickname: m.sender_nickname, header: `${m.sender_nickname}#${m.sender_user_id}` },
     }));
 
@@ -897,14 +1014,21 @@ app.get("/chat/dm/:conversation_id/history", authenticateToken, async (req, res)
   }
 });
 
+// -------------------- DM SEND (reply_to_id) --------------------
 app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
   const conversationId = req.params.conversation_id;
   const body = (req.body?.body || "").toString();
 
+  const replyToRaw = req.body?.reply_to_id;
+  const reply_to_id = replyToRaw === null || replyToRaw === undefined || replyToRaw === "" ? null : Number(replyToRaw);
+
   if (!body.trim()) return res.status(400).json({ error: "Message body required" });
   if (body.length > 1024) return res.status(400).json({ error: "Message too long (max 1024)" });
+  if (reply_to_id !== null && (!Number.isInteger(reply_to_id) || reply_to_id <= 0)) {
+    return res.status(400).json({ error: "reply_to_id must be positive integer or null" });
+  }
 
   const client = await pool.connect();
   try {
@@ -928,24 +1052,33 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
       return res.status(403).json({ error: "Not a member of this conversation" });
     }
 
+    if (reply_to_id !== null) {
+      const chk = await client.query(
+        `SELECT 1 FROM dm_messages WHERE id = $1 AND conversation_id = $2 LIMIT 1`,
+        [reply_to_id, conversationId]
+      );
+      if (!chk.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "reply_to_id not found in this conversation" });
+      }
+    }
+
     const me = await client.query("SELECT id, nickname FROM users WHERE id = $1 LIMIT 1", [req.user.uid]);
     if (me.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(401).json({ error: "User not found" });
     }
-
     const myNick = me.rows[0].nickname;
 
     const ins = await client.query(
-      `INSERT INTO dm_messages (conversation_id, sender_user_id, sender_nickname, body)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO dm_messages (conversation_id, sender_user_id, sender_nickname, body, reply_to_id)
+       VALUES ($1, $2, $3, $4, $5)
        RETURNING id, created_at`,
-      [conversationId, req.user.uid, myNick, body]
+      [conversationId, req.user.uid, myNick, body, reply_to_id]
     );
 
     const msgId = ins.rows[0].id;
     const createdAt = ins.rows[0].created_at;
-
     const otherId = req.user.uid === user_low ? user_high : user_low;
 
     // dm_contacts upsert for both sides
@@ -971,47 +1104,32 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
 
     await client.query("COMMIT");
 
-    // ✅ direct SSE (и дедуп на NOTIFY)
     const ssePayload = {
       type: "dm_message",
       id: msgId,
       conversation_id: conversationId,
       sender_user_id: req.user.uid,
       sender_nickname: myNick,
-      body,                // ✅ ВАЖНО
+      body,
       created_at: createdAt,
+      reply_to_id,
       instance: INSTANCE,
       source: "direct",
     };
 
     markRecent(recentDm, msgId);
 
-    const toLow = broadcastToUser(
-      user_low,
-      ssePayload,
-      (scope) => scope === "dm" || scope === `dm:${conversationId}`,
-      msgId
-    );
-    const toHigh = broadcastToUser(
-      user_high,
-      ssePayload,
-      (scope) => scope === "dm" || scope === `dm:${conversationId}`,
-      msgId
-    );
+    const toLow = broadcastToUser(user_low, ssePayload, (scope) => scope === "dm" || scope === `dm:${conversationId}`, msgId);
+    const toHigh = broadcastToUser(user_high, ssePayload, (scope) => scope === "dm" || scope === `dm:${conversationId}`, msgId);
 
     log("info", "dm.event.sse.sent", { msgId, convId: conversationId, source: "direct", toLow, toHigh });
 
-    // ✅ PUSH always to receiver
+    // push receiver
     try {
       await sendDmPush(otherId, {
         title: `Сообщение от ${myNick}`,
         body: body.length > 120 ? body.slice(0, 120) + "…" : body,
-        data: {
-          type: "dm",
-          conversation_id: conversationId,
-          sender_user_id: req.user.uid,
-          sender_nickname: myNick,
-        },
+        data: { type: "dm", conversation_id: conversationId, sender_user_id: req.user.uid, sender_nickname: myNick },
       });
     } catch (e) {
       log("warn", "push.send.failed", { err: e?.message || String(e) });
@@ -1019,15 +1137,7 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
 
     res.status(201).json({
       message: "sent",
-      data: {
-        id: msgId,
-        created_at: createdAt,
-        sender: {
-          user_id: req.user.uid,
-          nickname: myNick,
-          header: `${myNick}#${req.user.uid}`,
-        },
-      },
+      data: { id: msgId, created_at: createdAt, sender: { user_id: req.user.uid, nickname: myNick, header: `${myNick}#${req.user.uid}` } },
     });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch (_) {}
@@ -1038,7 +1148,53 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
   }
 });
 
-// DM contacts list (unread_count)
+// -------------------- DM REACT --------------------
+app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+
+  const conversationId = req.params.conversation_id;
+  const messageId = Number(req.params.message_id);
+  const reaction = Number(req.body?.reaction);
+
+  if (!Number.isInteger(messageId) || messageId <= 0) return res.status(400).json({ error: "bad message_id" });
+  if (![-1, 0, 1].includes(reaction)) return res.status(400).json({ error: "reaction must be -1, 0 or 1" });
+
+  try {
+    const pair = await pool.query(
+      `SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1`,
+      [conversationId]
+    );
+    if (!pair.rows.length) return res.status(404).json({ error: "conversation not found" });
+
+    const { user_low, user_high } = pair.rows[0];
+    if (req.user.uid !== user_low && req.user.uid !== user_high) return res.status(403).json({ error: "Not a member of this conversation" });
+
+    const msg = await pool.query(
+      `SELECT 1 FROM dm_messages WHERE id = $1 AND conversation_id = $2 LIMIT 1`,
+      [messageId, conversationId]
+    );
+    if (!msg.rows.length) return res.status(404).json({ error: "message not found in this conversation" });
+
+    if (reaction === 0) {
+      await pool.query(`DELETE FROM dm_reactions WHERE message_id = $1 AND user_id = $2`, [messageId, req.user.uid]);
+    } else {
+      await pool.query(
+        `INSERT INTO dm_reactions (message_id, user_id, reaction, updated_at)
+         VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+         ON CONFLICT (message_id, user_id)
+         DO UPDATE SET reaction = EXCLUDED.reaction, updated_at = CURRENT_TIMESTAMP`,
+        [messageId, req.user.uid, reaction]
+      );
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    log("error", "dm.react.failed", { err: e?.message || String(e), conversationId, messageId });
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// -------------------- CONTACTS (unread_count) --------------------
 app.get("/chat/contacts", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -1084,7 +1240,7 @@ app.get("/chat/contacts", authenticateToken, async (req, res) => {
   }
 });
 
-// отметить DM как прочитанный (до message_id)
+// -------------------- DM READ --------------------
 app.post("/chat/dm/:conversation_id/read", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -1097,10 +1253,7 @@ app.post("/chat/dm/:conversation_id/read", authenticateToken, async (req, res) =
 
   try {
     const pair = await pool.query(
-      `SELECT user_low, user_high
-       FROM dm_pairs
-       WHERE conversation_id = $1
-       LIMIT 1`,
+      `SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1`,
       [conversationId]
     );
     if (!pair.rows.length) return res.status(404).json({ error: "Conversation not found" });
@@ -1345,7 +1498,6 @@ async function startSubscriber() {
       const obj = safeJson(payload);
       const msgId = obj?.id;
 
-      // дедуп: если это уже ушло direct — не повторяем
       if (msgId && wasRecent(recentGlobal, msgId)) {
         log("debug", "notify.global_messages.skipped_recent", { msgId });
         return;
@@ -1356,8 +1508,9 @@ async function startSubscriber() {
         id: obj.id,
         user_id: obj.user_id,
         nickname: obj.nickname,
-        body: obj.body, // ✅ ВАЖНО
+        body: obj.body,
         created_at: obj.created_at,
+        reply_to_id: obj.reply_to_id ?? null,
         instance: INSTANCE,
         source: "notify",
       };
@@ -1380,7 +1533,6 @@ async function startSubscriber() {
           const obj = safeJson(payload);
           const msgId = obj?.id;
 
-          // дедуп: если уже ушло direct — не повторяем
           if (msgId && wasRecent(recentDm, msgId)) {
             log("debug", "notify.dm_messages.skipped_recent", { msgId });
             return;
@@ -1403,8 +1555,9 @@ async function startSubscriber() {
             conversation_id: convId,
             sender_user_id: obj.sender_user_id,
             sender_nickname: obj.sender_nickname,
-            body: obj.body, // ✅ ВАЖНО
+            body: obj.body,
             created_at: obj.created_at,
+            reply_to_id: obj.reply_to_id ?? null,
             instance: INSTANCE,
             source: "notify",
           };
@@ -1437,7 +1590,6 @@ async function startSubscriber() {
 async function main() {
   log("info", "boot", { instance: INSTANCE, port: PORT, log_level: LOG_LEVEL, has_firebase_json: !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON });
   await initDbForever();
-
   app.listen(PORT, () => log("info", "http.listening", { port: PORT, instance: INSTANCE }));
 }
 
