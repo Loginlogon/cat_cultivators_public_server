@@ -88,7 +88,7 @@ async function ensureRedisConnected() {
   }
 }
 
-const PRESENCE_TTL_SEC = Number(process.env.PRESENCE_TTL_SEC || 15);
+const PRESENCE_TTL_SEC = Number(process.env.PRESENCE_TTL_SEC || 60);
 function presenceKey(uid) {
   return `online:${uid}`;
 }
@@ -122,6 +122,14 @@ const clampInt = (v, def, min, max) => {
   const n = Number.isFinite(Number(v)) ? Number(v) : def;
   return Math.max(min, Math.min(max, Math.trunc(n)));
 };
+const parseBool = (v, def) => {
+  if (v === undefined || v === null) return def;
+  if (typeof v === "boolean") return v;
+  const s = String(v).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(s)) return true;
+  if (["0", "false", "no", "n", "off"].includes(s)) return false;
+  return def;
+};
 
 const requireAdmin = (req, res, next) => {
   const key = req.headers["x-admin-key"];
@@ -145,6 +153,86 @@ const authenticateToken = (req, res, next) => {
 async function getUserBasic(userId) {
   const r = await pool.query("SELECT id, login, nickname FROM users WHERE id = $1 LIMIT 1", [userId]);
   return r.rows[0] || null;
+}
+
+// -------------------- NOTIFICATION SETTINGS + DM MUTES --------------------
+async function ensureNotifSettingsRow(userId) {
+  await pool.query(
+    `INSERT INTO notification_settings (user_id)
+     VALUES ($1)
+     ON CONFLICT (user_id) DO NOTHING`,
+    [userId]
+  );
+}
+
+async function getNotifSettings(userId) {
+  await ensureNotifSettingsRow(userId);
+  const r = await pool.query(
+    `SELECT allow_dm, allow_mentions, allow_reactions
+     FROM notification_settings
+     WHERE user_id = $1
+     LIMIT 1`,
+    [userId]
+  );
+  const row = r.rows[0] || {};
+  return {
+    allow_dm: row.allow_dm !== false,
+    allow_mentions: row.allow_mentions !== false,
+    allow_reactions: row.allow_reactions !== false,
+  };
+}
+
+async function isDmMutedForRecipient(recipientId, senderId) {
+  const r = await pool.query(
+    `SELECT muted
+     FROM dm_mutes
+     WHERE owner_user_id = $1 AND muted_user_id = $2
+     LIMIT 1`,
+    [recipientId, senderId]
+  );
+  return r.rows[0]?.muted === true;
+}
+
+// -------------------- MENTIONS --------------------
+// формат: @nickname#123
+const MENTION_RE = /@([\p{L}\p{N}_\-\.]{1,64})#(\d{1,10})/gu;
+
+function extractMentionTokens(text) {
+  const out = [];
+  if (!text) return out;
+  let m;
+  while ((m = MENTION_RE.exec(text)) !== null) {
+    const nick = (m[1] || "").toString();
+    const id = Number(m[2]);
+    if (Number.isInteger(id) && id > 0) out.push({ id, nick });
+    if (out.length >= 50) break; // защита
+  }
+  return out;
+}
+
+async function resolveMentions(text) {
+  const tokens = extractMentionTokens(text).slice(0, 20);
+  if (!tokens.length) return [];
+
+  const ids = Array.from(new Set(tokens.map((t) => t.id))).slice(0, 20);
+  const r = await pool.query(
+    `SELECT id, nickname
+     FROM users
+     WHERE id = ANY($1::int[])`,
+    [ids]
+  );
+
+  const nickById = new Map(r.rows.map((x) => [Number(x.id), String(x.nickname || "")]));
+  const ok = [];
+
+  for (const t of tokens) {
+    const realNick = nickById.get(t.id);
+    if (!realNick) continue;
+    if (realNick.toLowerCase() !== String(t.nick || "").toLowerCase()) continue; // проверка соответствия
+    ok.push(t.id);
+  }
+
+  return Array.from(new Set(ok)).slice(0, 20);
 }
 
 // -------------------- FIREBASE (FCM) --------------------
@@ -186,22 +274,26 @@ function initFirebaseOnce() {
   }
 }
 
-async function sendDmPush(toUserId, { title, body, data }) {
+async function sendPush(toUserId, { type, title, body, data }) {
   if (!initFirebaseOnce()) return;
-
   const admin = getFirebaseAdmin();
   if (!admin) return;
 
   const t = await pool.query(`SELECT token FROM push_tokens WHERE user_id = $1`, [toUserId]);
   const tokens = t.rows.map((r) => r.token).filter(Boolean);
   if (!tokens.length) {
-    log("debug", "push.skip.no_tokens", { toUserId });
+    log("debug", "push.skip.no_tokens", { toUserId, type });
     return;
   }
 
-  const payloadData = { ...(data || {}), type: "dm", title: String(title || ""), body: String(body || "") };
+  const payloadData = {
+    ...(data || {}),
+    type: String(type || ""),
+    title: String(title || ""),
+    body: String(body || ""),
+  };
 
-  log("debug", "push.send.start", { toUserId, tokens: tokens.length });
+  log("debug", "push.send.start", { toUserId, type, tokens: tokens.length });
 
   const resp = await admin.messaging().sendEachForMulticast({
     tokens,
@@ -223,7 +315,38 @@ async function sendDmPush(toUserId, { title, body, data }) {
     log("warn", "push.tokens.cleaned", { toUserId, dead: dead.length });
   }
 
-  log("info", "push.send.done", { toUserId, ok: resp.successCount, total: tokens.length });
+  log("info", "push.send.done", { toUserId, type, ok: resp.successCount, total: tokens.length });
+}
+
+async function maybeSendDmPush(toUserId, fromUserId, payload) {
+  const s = await getNotifSettings(toUserId);
+  if (!s.allow_dm) {
+    log("debug", "push.dm.skip.settings", { toUserId });
+    return;
+  }
+  if (await isDmMutedForRecipient(toUserId, fromUserId)) {
+    log("debug", "push.dm.skip.muted", { toUserId, fromUserId });
+    return;
+  }
+  await sendPush(toUserId, payload);
+}
+
+async function maybeSendMentionPush(toUserId, payload) {
+  const s = await getNotifSettings(toUserId);
+  if (!s.allow_mentions) {
+    log("debug", "push.mention.skip.settings", { toUserId });
+    return;
+  }
+  await sendPush(toUserId, payload);
+}
+
+async function maybeSendReactionPush(toUserId, payload) {
+  const s = await getNotifSettings(toUserId);
+  if (!s.allow_reactions) {
+    log("debug", "push.reaction.skip.settings", { toUserId });
+    return;
+  }
+  await sendPush(toUserId, payload);
 }
 
 // -------------------- SSE --------------------
@@ -309,7 +432,8 @@ async function ensureNotifyTriggers(client) {
           'nickname', NEW.nickname,
           'body', NEW.body,
           'created_at', NEW.created_at,
-          'reply_to_id', NEW.reply_to_id
+          'reply_to_id', NEW.reply_to_id,
+          'mention_user_ids', NEW.mention_user_ids
         )::text
       );
       RETURN NEW;
@@ -329,7 +453,8 @@ async function ensureNotifyTriggers(client) {
           'sender_nickname', NEW.sender_nickname,
           'body', NEW.body,
           'created_at', NEW.created_at,
-          'reply_to_id', NEW.reply_to_id
+          'reply_to_id', NEW.reply_to_id,
+          'mention_user_ids', NEW.mention_user_ids
         )::text
       );
       RETURN NEW;
@@ -373,8 +498,10 @@ async function initDbForever() {
         );
       `);
       await client.query(`ALTER TABLE global_messages ADD COLUMN IF NOT EXISTS reply_to_id BIGINT;`);
+      await client.query(`ALTER TABLE global_messages ADD COLUMN IF NOT EXISTS mention_user_ids INTEGER[];`);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_global_messages_id_desc ON global_messages(id DESC);`);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_global_messages_reply_to ON global_messages(reply_to_id);`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_global_messages_mentions_gin ON global_messages USING GIN (mention_user_ids);`);
 
       await client.query(`
         CREATE TABLE IF NOT EXISTS conversations (
@@ -405,12 +532,14 @@ async function initDbForever() {
         );
       `);
       await client.query(`ALTER TABLE dm_messages ADD COLUMN IF NOT EXISTS reply_to_id BIGINT;`);
+      await client.query(`ALTER TABLE dm_messages ADD COLUMN IF NOT EXISTS mention_user_ids INTEGER[];`);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_messages_conv_id_desc ON dm_messages(conversation_id, id DESC);`);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_messages_reply_to ON dm_messages(conversation_id, reply_to_id);`);
       await client.query(`
         CREATE INDEX IF NOT EXISTS idx_dm_messages_conv_sender_id_desc
         ON dm_messages(conversation_id, sender_user_id, id DESC);
       `);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_messages_mentions_gin ON dm_messages USING GIN (mention_user_ids);`);
 
       await client.query(`
         CREATE TABLE IF NOT EXISTS dm_contacts (
@@ -485,6 +614,29 @@ async function initDbForever() {
       `);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_reactions_msg ON dm_reactions(message_id);`);
 
+      // notification settings
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS notification_settings (
+          user_id INTEGER PRIMARY KEY,
+          allow_dm BOOLEAN NOT NULL DEFAULT TRUE,
+          allow_mentions BOOLEAN NOT NULL DEFAULT TRUE,
+          allow_reactions BOOLEAN NOT NULL DEFAULT TRUE,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // dm mutes (mute push for DMs from конкретных людей)
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS dm_mutes (
+          owner_user_id INTEGER NOT NULL,
+          muted_user_id INTEGER NOT NULL,
+          muted BOOLEAN NOT NULL DEFAULT TRUE,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (owner_user_id, muted_user_id)
+        );
+      `);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_mutes_owner ON dm_mutes(owner_user_id);`);
+
       await ensureNotifyTriggers(client);
 
       await client.query("COMMIT");
@@ -536,7 +688,7 @@ app.get("/events", authenticateToken, async (req, res) => {
       sseComment(res, `keepalive ${Date.now()}`);
       await touchPresence(req.user.uid);
     } catch (_) {}
-  }, 15000);
+  }, 10000);
 
   req.on("close", () => {
     clearInterval(ka);
@@ -547,6 +699,46 @@ app.get("/events", authenticateToken, async (req, res) => {
 // -------------------- BASIC ROUTES --------------------
 app.get("/ping", (req, res) => {
   res.json({ status: "ok", message: "pong", service: "game-mail-service", server_time: new Date().toISOString() });
+});
+
+// -------------------- SETTINGS: notifications --------------------
+app.get("/settings/notifications", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+  try {
+    const s = await getNotifSettings(req.user.uid);
+    res.json({ user_id: req.user.uid, ...s });
+  } catch (e) {
+    log("error", "settings.notifications.get.failed", { err: e?.message || String(e) });
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/settings/notifications", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+  try {
+    await ensureNotifSettingsRow(req.user.uid);
+
+    const cur = await getNotifSettings(req.user.uid);
+
+    const allow_dm = parseBool(req.body?.allow_dm, cur.allow_dm);
+    const allow_mentions = parseBool(req.body?.allow_mentions, cur.allow_mentions);
+    const allow_reactions = parseBool(req.body?.allow_reactions, cur.allow_reactions);
+
+    await pool.query(
+      `UPDATE notification_settings
+       SET allow_dm = $2,
+           allow_mentions = $3,
+           allow_reactions = $4,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE user_id = $1`,
+      [req.user.uid, allow_dm, allow_mentions, allow_reactions]
+    );
+
+    res.json({ ok: true, user_id: req.user.uid, allow_dm, allow_mentions, allow_reactions });
+  } catch (e) {
+    log("error", "settings.notifications.set.failed", { err: e?.message || String(e) });
+    res.status(500).json({ error: "Database error" });
+  }
 });
 
 // -------------------- PUSH: register token --------------------
@@ -603,16 +795,22 @@ app.get("/users/search", authenticateToken, async (req, res) => {
 
   const nickname = (req.query.nickname || "").toString().trim();
   const limit = clampInt(req.query.limit, 20, 1, 50);
+  const contains = parseBool(req.query.contains, false);
+  const excludeSelf = parseBool(req.query.exclude_self, false);
+
   if (!nickname) return res.status(400).json({ error: "nickname query required" });
 
   try {
+    const pattern = contains ? `%${nickname}%` : `${nickname}%`;
+
     const r = await pool.query(
       `SELECT id, nickname
        FROM users
        WHERE nickname ILIKE $1
+         AND ($2::boolean = false OR id <> $3)
        ORDER BY id ASC
-       LIMIT $2`,
-      [nickname + "%", limit]
+       LIMIT $4`,
+      [pattern, excludeSelf, req.user.uid, limit]
     );
 
     res.json({
@@ -665,7 +863,7 @@ app.get("/chat/global/history", authenticateToken, async (req, res) => {
           AND r.message_id IN (SELECT id FROM base)
       )
       SELECT
-        m.id, m.user_id, m.nickname, m.body, m.created_at, m.reply_to_id,
+        m.id, m.user_id, m.nickname, m.body, m.created_at, m.reply_to_id, m.mention_user_ids,
         COALESCE(react.like_count, 0)    AS like_count,
         COALESCE(react.dislike_count, 0) AS dislike_count,
         COALESCE(my.reaction, 0)         AS my_reaction,
@@ -692,6 +890,7 @@ app.get("/chat/global/history", authenticateToken, async (req, res) => {
       like_count: m.like_count || 0,
       dislike_count: m.dislike_count || 0,
       my_reaction: m.my_reaction || 0,
+      mention_user_ids: m.mention_user_ids || [],
       reply_to: m.reply_id ? {
         id: m.reply_id,
         body: m.reply_body,
@@ -709,7 +908,7 @@ app.get("/chat/global/history", authenticateToken, async (req, res) => {
   }
 });
 
-// -------------------- GLOBAL SEND (reply_to_id) --------------------
+// -------------------- GLOBAL SEND (reply_to_id + mentions + mention push) --------------------
 app.post("/chat/global/send", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -732,11 +931,13 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
       if (!chk.rows.length) return res.status(400).json({ error: "reply_to_id not found" });
     }
 
+    const mentionIds = await resolveMentions(body);
+
     const insert = await pool.query(
-      `INSERT INTO global_messages (user_id, nickname, body, reply_to_id)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO global_messages (user_id, nickname, body, reply_to_id, mention_user_ids)
+       VALUES ($1, $2, $3, $4, $5)
        RETURNING id, created_at`,
-      [me.id, me.nickname, body, reply_to_id]
+      [me.id, me.nickname, body, reply_to_id, mentionIds.length ? mentionIds : null]
     );
 
     // чистка до 100
@@ -760,6 +961,7 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
       body,
       created_at: createdAt,
       reply_to_id,
+      mention_user_ids: mentionIds,
       instance: INSTANCE,
       source: "direct",
     };
@@ -775,6 +977,30 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
       }
     }
     log("info", "global.event.sse.sent", { msgId, source: "direct", sent });
+
+    // mention push
+    if (mentionIds.length) {
+      const snippet = body.length > 160 ? body.slice(0, 160) + "…" : body;
+      for (const uid of mentionIds) {
+        if (uid === me.id) continue;
+        try {
+          await maybeSendMentionPush(uid, {
+            type: "mention",
+            title: `Упоминание от ${me.nickname}`,
+            body: snippet,
+            data: {
+              context: "global",
+              kind: "global",
+              message_id: String(msgId),
+              from_user_id: String(me.id),
+              from_nickname: String(me.nickname),
+            },
+          });
+        } catch (e) {
+          log("warn", "push.mention.failed", { err: e?.message || String(e), to: uid, msgId });
+        }
+      }
+    }
 
     res.status(201).json({
       message: "sent",
@@ -812,7 +1038,7 @@ app.post("/chat/global/read", authenticateToken, async (req, res) => {
   }
 });
 
-// -------------------- GLOBAL REACT --------------------
+// -------------------- GLOBAL REACT (+ reaction push) --------------------
 app.post("/chat/global/:message_id/react", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -823,8 +1049,22 @@ app.post("/chat/global/:message_id/react", authenticateToken, async (req, res) =
   if (![-1, 0, 1].includes(reaction)) return res.status(400).json({ error: "reaction must be -1, 0 or 1" });
 
   try {
-    const chk = await pool.query(`SELECT 1 FROM global_messages WHERE id = $1 LIMIT 1`, [messageId]);
-    if (!chk.rows.length) return res.status(404).json({ error: "message not found" });
+    const msg = await pool.query(
+      `SELECT id, user_id, nickname, body
+       FROM global_messages
+       WHERE id = $1
+       LIMIT 1`,
+      [messageId]
+    );
+    if (!msg.rows.length) return res.status(404).json({ error: "message not found" });
+
+    const ownerId = Number(msg.rows[0].user_id);
+
+    const prev = await pool.query(
+      `SELECT reaction FROM global_reactions WHERE message_id = $1 AND user_id = $2 LIMIT 1`,
+      [messageId, req.user.uid]
+    );
+    const prevReaction = Number(prev.rows[0]?.reaction || 0);
 
     if (reaction === 0) {
       await pool.query(`DELETE FROM global_reactions WHERE message_id = $1 AND user_id = $2`, [messageId, req.user.uid]);
@@ -836,6 +1076,33 @@ app.post("/chat/global/:message_id/react", authenticateToken, async (req, res) =
          DO UPDATE SET reaction = EXCLUDED.reaction, updated_at = CURRENT_TIMESTAMP`,
         [messageId, req.user.uid, reaction]
       );
+    }
+
+    // ✅ push на новую реакцию (👍 или 👎), если не себе
+    if (reaction !== 0 && reaction !== prevReaction && ownerId !== req.user.uid) {
+      const me = await getUserBasic(req.user.uid);
+      if (me) {
+        const snippet = String(msg.rows[0].body || "");
+        const cut = snippet.length > 140 ? snippet.slice(0, 140) + "…" : snippet;
+        const emoji = reaction === 1 ? "👍" : "👎";
+        try {
+          await maybeSendReactionPush(ownerId, {
+            type: "reaction",
+            title: `${me.nickname} поставил ${emoji}`,
+            body: cut,
+            data: {
+              context: "global",
+              kind: "global",
+              reaction: String(reaction),
+              message_id: String(messageId),
+              from_user_id: String(me.id),
+              from_nickname: String(me.nickname),
+            },
+          });
+        } catch (e) {
+          log("warn", "push.reaction.failed", { err: e?.message || String(e), to: ownerId, messageId });
+        }
+      }
     }
 
     res.json({ ok: true });
@@ -970,7 +1237,7 @@ app.get("/chat/dm/:conversation_id/history", authenticateToken, async (req, res)
           AND r.message_id IN (SELECT id FROM base)
       )
       SELECT
-        m.id, m.sender_user_id, m.sender_nickname, m.body, m.created_at, m.reply_to_id,
+        m.id, m.sender_user_id, m.sender_nickname, m.body, m.created_at, m.reply_to_id, m.mention_user_ids,
         COALESCE(react.like_count, 0)    AS like_count,
         COALESCE(react.dislike_count, 0) AS dislike_count,
         COALESCE(my.reaction, 0)         AS my_reaction,
@@ -997,6 +1264,7 @@ app.get("/chat/dm/:conversation_id/history", authenticateToken, async (req, res)
       like_count: m.like_count || 0,
       dislike_count: m.dislike_count || 0,
       my_reaction: m.my_reaction || 0,
+      mention_user_ids: m.mention_user_ids || [],
       reply_to: m.reply_id ? {
         id: m.reply_id,
         body: m.reply_body,
@@ -1014,7 +1282,7 @@ app.get("/chat/dm/:conversation_id/history", authenticateToken, async (req, res)
   }
 });
 
-// -------------------- DM SEND (reply_to_id) --------------------
+// -------------------- DM SEND (reply_to_id + mentions + mute-aware push) --------------------
 app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -1070,11 +1338,13 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
     }
     const myNick = me.rows[0].nickname;
 
+    const mentionIds = await resolveMentions(body);
+
     const ins = await client.query(
-      `INSERT INTO dm_messages (conversation_id, sender_user_id, sender_nickname, body, reply_to_id)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO dm_messages (conversation_id, sender_user_id, sender_nickname, body, reply_to_id, mention_user_ids)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, created_at`,
-      [conversationId, req.user.uid, myNick, body, reply_to_id]
+      [conversationId, req.user.uid, myNick, body, reply_to_id, mentionIds.length ? mentionIds : null]
     );
 
     const msgId = ins.rows[0].id;
@@ -1113,6 +1383,7 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
       body,
       created_at: createdAt,
       reply_to_id,
+      mention_user_ids: mentionIds,
       instance: INSTANCE,
       source: "direct",
     };
@@ -1124,12 +1395,23 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
 
     log("info", "dm.event.sse.sent", { msgId, convId: conversationId, source: "direct", toLow, toHigh });
 
-    // push receiver
+    // push receiver (mute-aware + settings-aware)
     try {
-      await sendDmPush(otherId, {
+      await maybeSendDmPush(otherId, req.user.uid, {
+        type: "dm",
         title: `Сообщение от ${myNick}`,
         body: body.length > 120 ? body.slice(0, 120) + "…" : body,
-        data: { type: "dm", conversation_id: conversationId, sender_user_id: req.user.uid, sender_nickname: myNick },
+        data: {
+          context: "dm",
+          kind: "dm",
+          conversation_id: conversationId,
+          sender_user_id: String(req.user.uid),
+          sender_nickname: String(myNick),
+
+          // ✅ for local mute fallback on device
+          from_user_id: String(req.user.uid),
+          from_nickname: String(myNick),
+        },
       });
     } catch (e) {
       log("warn", "push.send.failed", { err: e?.message || String(e) });
@@ -1148,7 +1430,7 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
   }
 });
 
-// -------------------- DM REACT --------------------
+// -------------------- DM REACT (+ reaction push) --------------------
 app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -1170,10 +1452,21 @@ app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateTok
     if (req.user.uid !== user_low && req.user.uid !== user_high) return res.status(403).json({ error: "Not a member of this conversation" });
 
     const msg = await pool.query(
-      `SELECT 1 FROM dm_messages WHERE id = $1 AND conversation_id = $2 LIMIT 1`,
+      `SELECT id, sender_user_id, body
+       FROM dm_messages
+       WHERE id = $1 AND conversation_id = $2
+       LIMIT 1`,
       [messageId, conversationId]
     );
     if (!msg.rows.length) return res.status(404).json({ error: "message not found in this conversation" });
+
+    const ownerId = Number(msg.rows[0].sender_user_id);
+
+    const prev = await pool.query(
+      `SELECT reaction FROM dm_reactions WHERE message_id = $1 AND user_id = $2 LIMIT 1`,
+      [messageId, req.user.uid]
+    );
+    const prevReaction = Number(prev.rows[0]?.reaction || 0);
 
     if (reaction === 0) {
       await pool.query(`DELETE FROM dm_reactions WHERE message_id = $1 AND user_id = $2`, [messageId, req.user.uid]);
@@ -1187,6 +1480,34 @@ app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateTok
       );
     }
 
+    // ✅ push на новую реакцию (👍 или 👎), если не себе
+    if (reaction !== 0 && reaction !== prevReaction && ownerId !== req.user.uid) {
+      const me = await getUserBasic(req.user.uid);
+      if (me) {
+        const snippet = String(msg.rows[0].body || "");
+        const cut = snippet.length > 140 ? snippet.slice(0, 140) + "…" : snippet;
+        const emoji = reaction === 1 ? "👍" : "👎";
+        try {
+          await maybeSendReactionPush(ownerId, {
+            type: "reaction",
+            title: `${me.nickname} поставил ${emoji}`,
+            body: cut,
+            data: {
+              context: "dm",
+              kind: "dm",
+              reaction: String(reaction),
+              conversation_id: String(conversationId),
+              message_id: String(messageId),
+              from_user_id: String(me.id),
+              from_nickname: String(me.nickname),
+            },
+          });
+        } catch (e) {
+          log("warn", "push.reaction.failed", { err: e?.message || String(e), to: ownerId, messageId, conversationId });
+        }
+      }
+    }
+
     res.json({ ok: true });
   } catch (e) {
     log("error", "dm.react.failed", { err: e?.message || String(e), conversationId, messageId });
@@ -1194,7 +1515,7 @@ app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateTok
   }
 });
 
-// -------------------- CONTACTS (unread_count) --------------------
+// -------------------- CONTACTS (unread_count + muted) --------------------
 app.get("/chat/contacts", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -1207,15 +1528,19 @@ app.get("/chat/contacts", authenticateToken, async (req, res) => {
          c.last_read_message_id,
          c.last_at,
          u.nickname,
+         COALESCE(m.muted, false) AS muted,
          (
            SELECT COUNT(*)::int
-           FROM dm_messages m
-           WHERE m.conversation_id = c.conversation_id
-             AND m.sender_user_id = c.contact_user_id
-             AND m.id > COALESCE(c.last_read_message_id, 0)
+           FROM dm_messages mm
+           WHERE mm.conversation_id = c.conversation_id
+             AND mm.sender_user_id = c.contact_user_id
+             AND mm.id > COALESCE(c.last_read_message_id, 0)
          ) AS unread_count
        FROM dm_contacts c
        JOIN users u ON u.id = c.contact_user_id
+       LEFT JOIN dm_mutes m
+         ON m.owner_user_id = c.owner_user_id
+        AND m.muted_user_id = c.contact_user_id
        WHERE c.owner_user_id = $1
        ORDER BY c.last_at DESC NULLS LAST
        LIMIT 200`,
@@ -1232,6 +1557,7 @@ app.get("/chat/contacts", authenticateToken, async (req, res) => {
         last_read_message_id: x.last_read_message_id,
         last_at: x.last_at,
         unread_count: x.unread_count || 0,
+        muted: x.muted === true,
       })),
     });
   } catch (e) {
@@ -1273,6 +1599,70 @@ app.post("/chat/dm/:conversation_id/read", authenticateToken, async (req, res) =
     res.json({ ok: true, conversation_id: conversationId, last_read_message_id });
   } catch (e) {
     log("error", "dm.read.failed", { err: e?.message || String(e), conversationId });
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// -------------------- DM MUTE (toggle push from this contact) --------------------
+app.get("/chat/dm/:conversation_id/mute", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+  const conversationId = req.params.conversation_id;
+
+  try {
+    const pair = await pool.query(
+      `SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1`,
+      [conversationId]
+    );
+    if (!pair.rows.length) return res.status(404).json({ error: "Conversation not found" });
+
+    const { user_low, user_high } = pair.rows[0];
+    if (req.user.uid !== user_low && req.user.uid !== user_high) return res.status(403).json({ error: "Not a member of this conversation" });
+
+    const otherId = req.user.uid === user_low ? user_high : user_low;
+
+    const r = await pool.query(
+      `SELECT muted
+       FROM dm_mutes
+       WHERE owner_user_id = $1 AND muted_user_id = $2
+       LIMIT 1`,
+      [req.user.uid, otherId]
+    );
+
+    res.json({ ok: true, conversation_id: conversationId, contact_user_id: otherId, muted: r.rows[0]?.muted === true });
+  } catch (e) {
+    log("error", "dm.mute.get.failed", { err: e?.message || String(e), conversationId });
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/chat/dm/:conversation_id/mute", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+  const conversationId = req.params.conversation_id;
+  const muted = parseBool(req.body?.muted, true);
+
+  try {
+    const pair = await pool.query(
+      `SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1`,
+      [conversationId]
+    );
+    if (!pair.rows.length) return res.status(404).json({ error: "Conversation not found" });
+
+    const { user_low, user_high } = pair.rows[0];
+    if (req.user.uid !== user_low && req.user.uid !== user_high) return res.status(403).json({ error: "Not a member of this conversation" });
+
+    const otherId = req.user.uid === user_low ? user_high : user_low;
+
+    await pool.query(
+      `INSERT INTO dm_mutes (owner_user_id, muted_user_id, muted, updated_at)
+       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+       ON CONFLICT (owner_user_id, muted_user_id)
+       DO UPDATE SET muted = EXCLUDED.muted, updated_at = CURRENT_TIMESTAMP`,
+      [req.user.uid, otherId, muted]
+    );
+
+    res.json({ ok: true, conversation_id: conversationId, contact_user_id: otherId, muted });
+  } catch (e) {
+    log("error", "dm.mute.set.failed", { err: e?.message || String(e), conversationId });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -1511,6 +1901,7 @@ async function startSubscriber() {
         body: obj.body,
         created_at: obj.created_at,
         reply_to_id: obj.reply_to_id ?? null,
+        mention_user_ids: obj.mention_user_ids || [],
         instance: INSTANCE,
         source: "notify",
       };
@@ -1558,6 +1949,7 @@ async function startSubscriber() {
             body: obj.body,
             created_at: obj.created_at,
             reply_to_id: obj.reply_to_id ?? null,
+            mention_user_ids: obj.mention_user_ids || [],
             instance: INSTANCE,
             source: "notify",
           };
