@@ -719,10 +719,9 @@ app.post("/settings/notifications", authenticateToken, async (req, res) => {
     await ensureNotifSettingsRow(req.user.uid);
 
     const cur = await getNotifSettings(req.user.uid);
-
-    const allow_dm = parseBool(req.body?.allow_dm, cur.allow_dm);
-    const allow_mentions = parseBool(req.body?.allow_mentions, cur.allow_mentions);
-    const allow_reactions = parseBool(req.body?.allow_reactions, cur.allow_reactions);
+    const allow_dm = parseBool((req.body?.allow_dm ?? req.body?.dm_enabled), cur.allow_dm);
+    const allow_mentions = parseBool((req.body?.allow_mentions ?? req.body?.mentions_enabled), cur.allow_mentions);
+    const allow_reactions = parseBool((req.body?.allow_reactions ?? req.body?.global_reactions_enabled ?? req.body?.reactions_enabled), cur.allow_reactions);
 
     await pool.query(
       `UPDATE notification_settings
@@ -740,6 +739,66 @@ app.post("/settings/notifications", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Database error" });
   }
 });
+app.get("/prefs/notifications", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+  try {
+    await ensureNotifSettingsRow(req.user.uid);
+
+    const r = await pool.query(
+      `SELECT allow_dm, allow_mentions, allow_reactions, updated_at
+       FROM notification_settings
+       WHERE user_id = $1
+       LIMIT 1`,
+      [req.user.uid]
+    );
+
+    const row = r.rows[0] || {};
+    res.json({
+      dm_enabled: row.allow_dm !== false,
+      mentions_enabled: row.allow_mentions !== false,
+      global_reactions_enabled: row.allow_reactions !== false,
+      updated_at: row.updated_at || new Date().toISOString(),
+    });
+  } catch (e) {
+    log("error", "prefs.notifications.get.failed", { err: e?.message || String(e) });
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/prefs/notifications", authenticateToken, async (req, res) => {
+  await touchPresence(req.user.uid);
+  try {
+    await ensureNotifSettingsRow(req.user.uid);
+
+    const cur = await getNotifSettings(req.user.uid);
+
+    const allow_dm = parseBool((req.body?.dm_enabled ?? req.body?.allow_dm), cur.allow_dm);
+    const allow_mentions = parseBool((req.body?.mentions_enabled ?? req.body?.allow_mentions), cur.allow_mentions);
+    const allow_reactions = parseBool((req.body?.global_reactions_enabled ?? req.body?.allow_reactions ?? req.body?.reactions_enabled), cur.allow_reactions);
+
+    const upd = await pool.query(
+      `UPDATE notification_settings
+       SET allow_dm = $2,
+           allow_mentions = $3,
+           allow_reactions = $4,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE user_id = $1
+       RETURNING updated_at`,
+      [req.user.uid, allow_dm, allow_mentions, allow_reactions]
+    );
+
+    res.json({
+      dm_enabled: allow_dm,
+      mentions_enabled: allow_mentions,
+      global_reactions_enabled: allow_reactions,
+      updated_at: upd.rows[0]?.updated_at || new Date().toISOString(),
+    });
+  } catch (e) {
+    log("error", "prefs.notifications.set.failed", { err: e?.message || String(e) });
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
 
 // -------------------- PUSH: register token --------------------
 app.post("/push/register", authenticateToken, async (req, res) => {
@@ -1628,7 +1687,16 @@ app.get("/chat/dm/:conversation_id/mute", authenticateToken, async (req, res) =>
       [req.user.uid, otherId]
     );
 
-    res.json({ ok: true, conversation_id: conversationId, contact_user_id: otherId, muted: r.rows[0]?.muted === true });
+    const muted = r.rows[0]?.muted === true;
+
+    res.json({
+      ok: true,
+      conversation_id: conversationId,
+      contact_user_id: otherId,
+      muted,
+      muted_user_id: otherId,
+      mute: muted,
+    });
   } catch (e) {
     log("error", "dm.mute.get.failed", { err: e?.message || String(e), conversationId });
     res.status(500).json({ error: "Database error" });
@@ -1638,7 +1706,7 @@ app.get("/chat/dm/:conversation_id/mute", authenticateToken, async (req, res) =>
 app.post("/chat/dm/:conversation_id/mute", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
   const conversationId = req.params.conversation_id;
-  const muted = parseBool(req.body?.muted, true);
+  const muted = parseBool((req.body?.muted ?? req.body?.mute), true);
 
   try {
     const pair = await pool.query(
@@ -1660,7 +1728,14 @@ app.post("/chat/dm/:conversation_id/mute", authenticateToken, async (req, res) =
       [req.user.uid, otherId, muted]
     );
 
-    res.json({ ok: true, conversation_id: conversationId, contact_user_id: otherId, muted });
+    res.json({
+      ok: true,
+      conversation_id: conversationId,
+      contact_user_id: otherId,
+      muted,
+      muted_user_id: otherId,
+      mute: muted,
+    });
   } catch (e) {
     log("error", "dm.mute.set.failed", { err: e?.message || String(e), conversationId });
     res.status(500).json({ error: "Database error" });
