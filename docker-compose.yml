@@ -57,6 +57,25 @@ services:
       redis:
         condition: service_healthy
 
+  notification-service:
+    build: ./notification-service
+    restart: always
+    ports:
+      - "3002:3002"
+    secrets:
+      - ACCESS_SECRET
+      - ADMIN_SECRET_KEY
+      - DB_USER
+      - DB_PASSWORD
+      - DB_NAME
+      - FIREBASE_SERVICE_ACCOUNT_JSON
+    environment:
+      LOG_LEVEL: debug
+      PORT: 3002
+    depends_on:
+      db:
+        condition: service_healthy
+
   game-mail:
     build: ./game-mail-service
     restart: always
@@ -68,17 +87,19 @@ services:
       - DB_USER
       - DB_PASSWORD
       - DB_NAME
-      - FIREBASE_SERVICE_ACCOUNT_JSON
     environment:
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: debug
       SSE_DEBUG: "1"
       PORT: 3001
+      NOTIFICATION_URL: http://notification-service:3002
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+      notification-service:
+        condition: service_started
 
   adminer:
     image: adminer

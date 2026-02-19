@@ -15,7 +15,7 @@ app.use(express.json({ limit: "1mb" }));
 let ACCESS_SECRET, ADMIN_SECRET_KEY, DATABASE_URL, REDIS_URL, PORT, LOG_LEVEL;
 try {
   ACCESS_SECRET = readEnv("ACCESS_SECRET");
-  ADMIN_SECRET_KEY = readEnv("ADMIN_SECRET_KEY");
+  ADMIN_SECRET_KEY = readEnv("ADMIN_SECRET_KEY", { required: false, allowEmpty: true }) || "";
   DATABASE_URL = readEnv("DATABASE_URL");
   REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
   PORT = Number(process.env.PORT || 3001);
@@ -26,6 +26,9 @@ try {
 }
 
 const INSTANCE = process.env.INSTANCE_ID || require("os").hostname();
+
+// куда проксировать уведомления
+const NOTIFICATION_URL = (process.env.NOTIFICATION_URL || "http://notification-service:3002").replace(/\/+$/, "");
 
 // -------------------- LOGGER --------------------
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -155,42 +158,68 @@ async function getUserBasic(userId) {
   return r.rows[0] || null;
 }
 
-// -------------------- NOTIFICATION SETTINGS + DM MUTES --------------------
-async function ensureNotifSettingsRow(userId) {
-  await pool.query(
-    `INSERT INTO notification_settings (user_id)
-     VALUES ($1)
-     ON CONFLICT (user_id) DO NOTHING`,
-    [userId]
-  );
+// -------------------- PROXY TO NOTIFICATION-SERVICE --------------------
+async function proxyToNotification(req, res) {
+  try {
+    const target = new URL(NOTIFICATION_URL + req.originalUrl);
+
+    const headers = {};
+    if (req.headers.authorization) headers["authorization"] = req.headers.authorization;
+    headers["content-type"] = "application/json; charset=utf-8";
+
+    const method = req.method.toUpperCase();
+    const hasBody = !["GET", "HEAD"].includes(method);
+
+    const r = await fetch(target.toString(), {
+      method,
+      headers,
+      body: hasBody ? JSON.stringify(req.body ?? {}) : undefined,
+    });
+
+    const text = await r.text();
+    const ct = r.headers.get("content-type");
+    if (ct) res.setHeader("content-type", ct);
+
+    res.status(r.status).send(text);
+  } catch (e) {
+    log("error", "proxy.notification.failed", { err: e?.message || String(e), path: req.originalUrl });
+    res.status(502).json({ error: "notification-service unavailable" });
+  }
 }
 
-async function getNotifSettings(userId) {
-  await ensureNotifSettingsRow(userId);
-  const r = await pool.query(
-    `SELECT allow_dm, allow_mentions, allow_reactions
-     FROM notification_settings
-     WHERE user_id = $1
-     LIMIT 1`,
-    [userId]
-  );
-  const row = r.rows[0] || {};
-  return {
-    allow_dm: row.allow_dm !== false,
-    allow_mentions: row.allow_mentions !== false,
-    allow_reactions: row.allow_reactions !== false,
-  };
-}
+async function sendInternalPush({ kind, to_user_id, from_user_id, type, title, body, data }) {
+  if (!ADMIN_SECRET_KEY) {
+    log("warn", "internal.push.skip.no_admin_key");
+    return;
+  }
+  try {
+    const url = `${NOTIFICATION_URL}/internal/push/send`;
+    const payload = {
+      kind,
+      to_user_id,
+      from_user_id: from_user_id ?? null,
+      type,
+      title,
+      body,
+      data: data || {},
+    };
 
-async function isDmMutedForRecipient(recipientId, senderId) {
-  const r = await pool.query(
-    `SELECT muted
-     FROM dm_mutes
-     WHERE owner_user_id = $1 AND muted_user_id = $2
-     LIMIT 1`,
-    [recipientId, senderId]
-  );
-  return r.rows[0]?.muted === true;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "x-admin-key": ADMIN_SECRET_KEY,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      log("warn", "internal.push.failed", { code: r.status, kind, to_user_id, txt: txt.slice(0, 300) });
+    }
+  } catch (e) {
+    log("warn", "internal.push.failed", { err: e?.message || String(e), kind, to_user_id });
+  }
 }
 
 // -------------------- MENTIONS --------------------
@@ -228,125 +257,11 @@ async function resolveMentions(text) {
   for (const t of tokens) {
     const realNick = nickById.get(t.id);
     if (!realNick) continue;
-    if (realNick.toLowerCase() !== String(t.nick || "").toLowerCase()) continue; // проверка соответствия
+    if (realNick.toLowerCase() !== String(t.nick || "").toLowerCase()) continue;
     ok.push(t.id);
   }
 
   return Array.from(new Set(ok)).slice(0, 20);
-}
-
-// -------------------- FIREBASE (FCM) --------------------
-let firebaseReady = false;
-let _admin = null;
-
-function getFirebaseAdmin() {
-  if (_admin) return _admin;
-  try {
-    _admin = require("firebase-admin");
-    return _admin;
-  } catch (e) {
-    log("warn", "firebase.not_installed", { note: "firebase-admin not installed, push disabled" });
-    return null;
-  }
-}
-
-function initFirebaseOnce() {
-  if (firebaseReady) return true;
-
-  const admin = getFirebaseAdmin();
-  if (!admin) return false;
-
-  const json = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (!json) {
-    log("warn", "firebase.no_service_account_json", { note: "FIREBASE_SERVICE_ACCOUNT_JSON not set, push disabled" });
-    return false;
-  }
-
-  try {
-    const serviceAccount = JSON.parse(json);
-    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-    firebaseReady = true;
-    log("info", "firebase.ready");
-    return true;
-  } catch (e) {
-    log("error", "firebase.init_failed", { err: e?.message || String(e) });
-    return false;
-  }
-}
-
-async function sendPush(toUserId, { type, title, body, data }) {
-  if (!initFirebaseOnce()) return;
-  const admin = getFirebaseAdmin();
-  if (!admin) return;
-
-  const t = await pool.query(`SELECT token FROM push_tokens WHERE user_id = $1`, [toUserId]);
-  const tokens = t.rows.map((r) => r.token).filter(Boolean);
-  if (!tokens.length) {
-    log("debug", "push.skip.no_tokens", { toUserId, type });
-    return;
-  }
-
-  const payloadData = {
-    ...(data || {}),
-    type: String(type || ""),
-    title: String(title || ""),
-    body: String(body || ""),
-  };
-
-  log("debug", "push.send.start", { toUserId, type, tokens: tokens.length });
-
-  const resp = await admin.messaging().sendEachForMulticast({
-    tokens,
-    data: Object.fromEntries(Object.entries(payloadData).map(([k, v]) => [k, String(v)])),
-    android: { priority: "high" },
-  });
-
-  const dead = [];
-  resp.responses.forEach((r, idx) => {
-    if (r.success) return;
-    const code = r.error?.code || "";
-    if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
-      dead.push(tokens[idx]);
-    }
-  });
-
-  if (dead.length) {
-    await pool.query(`DELETE FROM push_tokens WHERE user_id = $1 AND token = ANY($2::text[])`, [toUserId, dead]);
-    log("warn", "push.tokens.cleaned", { toUserId, dead: dead.length });
-  }
-
-  log("info", "push.send.done", { toUserId, type, ok: resp.successCount, total: tokens.length });
-}
-
-async function maybeSendDmPush(toUserId, fromUserId, payload) {
-  const s = await getNotifSettings(toUserId);
-  if (!s.allow_dm) {
-    log("debug", "push.dm.skip.settings", { toUserId });
-    return;
-  }
-  if (await isDmMutedForRecipient(toUserId, fromUserId)) {
-    log("debug", "push.dm.skip.muted", { toUserId, fromUserId });
-    return;
-  }
-  await sendPush(toUserId, payload);
-}
-
-async function maybeSendMentionPush(toUserId, payload) {
-  const s = await getNotifSettings(toUserId);
-  if (!s.allow_mentions) {
-    log("debug", "push.mention.skip.settings", { toUserId });
-    return;
-  }
-  await sendPush(toUserId, payload);
-}
-
-async function maybeSendReactionPush(toUserId, payload) {
-  const s = await getNotifSettings(toUserId);
-  if (!s.allow_reactions) {
-    log("debug", "push.reaction.skip.settings", { toUserId });
-    return;
-  }
-  await sendPush(toUserId, payload);
 }
 
 // -------------------- SSE --------------------
@@ -399,7 +314,7 @@ function broadcastToUser(uid, payload, scopeFilterFn = null, id = null) {
   return sent;
 }
 
-// -------------------- DEDUPE --------------------
+// -------------------- DEDUPE (SSE notify) --------------------
 const RECENT_TTL_MS = Number(process.env.RECENT_TTL_MS || 10000);
 const recentGlobal = new Map();
 const recentDm = new Map();
@@ -419,7 +334,7 @@ setInterval(() => {
   for (const [k, ts] of recentDm.entries()) if (now - ts > RECENT_TTL_MS) recentDm.delete(k);
 }, 5000).unref?.();
 
-// -------------------- DB: triggers for NOTIFY --------------------
+// -------------------- DB: triggers for NOTIFY (for SSE sync between instances) --------------------
 async function ensureNotifyTriggers(client) {
   await client.query(`
     CREATE OR REPLACE FUNCTION notify_global_message() RETURNS trigger AS $$
@@ -580,17 +495,6 @@ async function initDbForever() {
         );
       `);
 
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS push_tokens (
-          user_id INTEGER NOT NULL,
-          token TEXT NOT NULL,
-          platform TEXT NOT NULL DEFAULT 'android' CHECK (platform IN ('android')),
-          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          PRIMARY KEY (user_id, token)
-        );
-      `);
-      await client.query(`CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(user_id);`);
-
       // reactions
       await client.query(`
         CREATE TABLE IF NOT EXISTS global_reactions (
@@ -613,29 +517,6 @@ async function initDbForever() {
         );
       `);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_reactions_msg ON dm_reactions(message_id);`);
-
-      // notification settings
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS notification_settings (
-          user_id INTEGER PRIMARY KEY,
-          allow_dm BOOLEAN NOT NULL DEFAULT TRUE,
-          allow_mentions BOOLEAN NOT NULL DEFAULT TRUE,
-          allow_reactions BOOLEAN NOT NULL DEFAULT TRUE,
-          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-      `);
-
-      // dm mutes (mute push for DMs from конкретных людей)
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS dm_mutes (
-          owner_user_id INTEGER NOT NULL,
-          muted_user_id INTEGER NOT NULL,
-          muted BOOLEAN NOT NULL DEFAULT TRUE,
-          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          PRIMARY KEY (owner_user_id, muted_user_id)
-        );
-      `);
-      await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_mutes_owner ON dm_mutes(owner_user_id);`);
 
       await ensureNotifyTriggers(client);
 
@@ -701,126 +582,19 @@ app.get("/ping", (req, res) => {
   res.json({ status: "ok", message: "pong", service: "game-mail-service", server_time: new Date().toISOString() });
 });
 
-// -------------------- SETTINGS: notifications --------------------
-app.get("/settings/notifications", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-  try {
-    const s = await getNotifSettings(req.user.uid);
-    res.json({ user_id: req.user.uid, ...s });
-  } catch (e) {
-    log("error", "settings.notifications.get.failed", { err: e?.message || String(e) });
-    res.status(500).json({ error: "Database error" });
-  }
-});
+// -------------------- NOTIFICATIONS ROUTES (PROXY) --------------------
+app.get("/settings/notifications", authenticateToken, proxyToNotification);
+app.post("/settings/notifications", authenticateToken, proxyToNotification);
 
-app.post("/settings/notifications", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-  try {
-    await ensureNotifSettingsRow(req.user.uid);
+app.get("/prefs/notifications", authenticateToken, proxyToNotification);
+app.post("/prefs/notifications", authenticateToken, proxyToNotification);
 
-    const cur = await getNotifSettings(req.user.uid);
-    const allow_dm = parseBool((req.body?.allow_dm ?? req.body?.dm_enabled), cur.allow_dm);
-    const allow_mentions = parseBool((req.body?.allow_mentions ?? req.body?.mentions_enabled), cur.allow_mentions);
-    const allow_reactions = parseBool((req.body?.allow_reactions ?? req.body?.global_reactions_enabled ?? req.body?.reactions_enabled), cur.allow_reactions);
+app.post("/push/register", authenticateToken, proxyToNotification);
 
-    await pool.query(
-      `UPDATE notification_settings
-       SET allow_dm = $2,
-           allow_mentions = $3,
-           allow_reactions = $4,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE user_id = $1`,
-      [req.user.uid, allow_dm, allow_mentions, allow_reactions]
-    );
+app.get("/chat/dm/:conversation_id/mute", authenticateToken, proxyToNotification);
+app.post("/chat/dm/:conversation_id/mute", authenticateToken, proxyToNotification);
 
-    res.json({ ok: true, user_id: req.user.uid, allow_dm, allow_mentions, allow_reactions });
-  } catch (e) {
-    log("error", "settings.notifications.set.failed", { err: e?.message || String(e) });
-    res.status(500).json({ error: "Database error" });
-  }
-});
-app.get("/prefs/notifications", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-  try {
-    await ensureNotifSettingsRow(req.user.uid);
-
-    const r = await pool.query(
-      `SELECT allow_dm, allow_mentions, allow_reactions, updated_at
-       FROM notification_settings
-       WHERE user_id = $1
-       LIMIT 1`,
-      [req.user.uid]
-    );
-
-    const row = r.rows[0] || {};
-    res.json({
-      dm_enabled: row.allow_dm !== false,
-      mentions_enabled: row.allow_mentions !== false,
-      global_reactions_enabled: row.allow_reactions !== false,
-      updated_at: row.updated_at || new Date().toISOString(),
-    });
-  } catch (e) {
-    log("error", "prefs.notifications.get.failed", { err: e?.message || String(e) });
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-app.post("/prefs/notifications", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-  try {
-    await ensureNotifSettingsRow(req.user.uid);
-
-    const cur = await getNotifSettings(req.user.uid);
-
-    const allow_dm = parseBool((req.body?.dm_enabled ?? req.body?.allow_dm), cur.allow_dm);
-    const allow_mentions = parseBool((req.body?.mentions_enabled ?? req.body?.allow_mentions), cur.allow_mentions);
-    const allow_reactions = parseBool((req.body?.global_reactions_enabled ?? req.body?.allow_reactions ?? req.body?.reactions_enabled), cur.allow_reactions);
-
-    const upd = await pool.query(
-      `UPDATE notification_settings
-       SET allow_dm = $2,
-           allow_mentions = $3,
-           allow_reactions = $4,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE user_id = $1
-       RETURNING updated_at`,
-      [req.user.uid, allow_dm, allow_mentions, allow_reactions]
-    );
-
-    res.json({
-      dm_enabled: allow_dm,
-      mentions_enabled: allow_mentions,
-      global_reactions_enabled: allow_reactions,
-      updated_at: upd.rows[0]?.updated_at || new Date().toISOString(),
-    });
-  } catch (e) {
-    log("error", "prefs.notifications.set.failed", { err: e?.message || String(e) });
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-
-// -------------------- PUSH: register token --------------------
-app.post("/push/register", authenticateToken, async (req, res) => {
-  const token = (req.body?.token || "").toString().trim();
-  if (!token) return res.status(400).json({ error: "token required" });
-  if (token.length > 4096) return res.status(400).json({ error: "token too long" });
-
-  try {
-    await pool.query(
-      `INSERT INTO push_tokens (user_id, token, platform, updated_at)
-       VALUES ($1, $2, 'android', CURRENT_TIMESTAMP)
-       ON CONFLICT (user_id, token)
-       DO UPDATE SET updated_at = CURRENT_TIMESTAMP`,
-      [req.user.uid, token]
-    );
-    log("info", "push.register.ok", { uid: req.user.uid, tokenLen: token.length });
-    res.json({ ok: true });
-  } catch (e) {
-    log("error", "push.register.failed", { err: e?.message || String(e) });
-    res.status(500).json({ error: "Database error" });
-  }
-});
+app.get("/notifications/summary", authenticateToken, proxyToNotification);
 
 // -------------------- Presence --------------------
 app.post("/presence/offline", authenticateToken, async (req, res) => {
@@ -967,7 +741,7 @@ app.get("/chat/global/history", authenticateToken, async (req, res) => {
   }
 });
 
-// -------------------- GLOBAL SEND (reply_to_id + mentions + mention push) --------------------
+// -------------------- GLOBAL SEND (reply_to_id + mentions + mention push via notification-service) --------------------
 app.post("/chat/global/send", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -1037,27 +811,26 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
     }
     log("info", "global.event.sse.sent", { msgId, source: "direct", sent });
 
-    // mention push
+    // mention push (в notification-service)
     if (mentionIds.length) {
       const snippet = body.length > 160 ? body.slice(0, 160) + "…" : body;
       for (const uid of mentionIds) {
         if (uid === me.id) continue;
-        try {
-          await maybeSendMentionPush(uid, {
-            type: "mention",
-            title: `Упоминание от ${me.nickname}`,
-            body: snippet,
-            data: {
-              context: "global",
-              kind: "global",
-              message_id: String(msgId),
-              from_user_id: String(me.id),
-              from_nickname: String(me.nickname),
-            },
-          });
-        } catch (e) {
-          log("warn", "push.mention.failed", { err: e?.message || String(e), to: uid, msgId });
-        }
+        await sendInternalPush({
+          kind: "mention",
+          to_user_id: uid,
+          from_user_id: me.id,
+          type: "mention",
+          title: `Упоминание от ${me.nickname}`,
+          body: snippet,
+          data: {
+            context: "global",
+            kind: "global",
+            message_id: String(msgId),
+            from_user_id: String(me.id),
+            from_nickname: String(me.nickname),
+          },
+        });
       }
     }
 
@@ -1097,7 +870,7 @@ app.post("/chat/global/read", authenticateToken, async (req, res) => {
   }
 });
 
-// -------------------- GLOBAL REACT (+ reaction push) --------------------
+// -------------------- GLOBAL REACT (+ reaction push via notification-service) --------------------
 app.post("/chat/global/:message_id/react", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -1137,30 +910,30 @@ app.post("/chat/global/:message_id/react", authenticateToken, async (req, res) =
       );
     }
 
-    // ✅ push на новую реакцию (👍 или 👎), если не себе
+    // push на новую реакцию, если не себе (в notification-service)
     if (reaction !== 0 && reaction !== prevReaction && ownerId !== req.user.uid) {
       const me = await getUserBasic(req.user.uid);
       if (me) {
         const snippet = String(msg.rows[0].body || "");
         const cut = snippet.length > 140 ? snippet.slice(0, 140) + "…" : snippet;
         const emoji = reaction === 1 ? "👍" : "👎";
-        try {
-          await maybeSendReactionPush(ownerId, {
-            type: "reaction",
-            title: `${me.nickname} поставил ${emoji}`,
-            body: cut,
-            data: {
-              context: "global",
-              kind: "global",
-              reaction: String(reaction),
-              message_id: String(messageId),
-              from_user_id: String(me.id),
-              from_nickname: String(me.nickname),
-            },
-          });
-        } catch (e) {
-          log("warn", "push.reaction.failed", { err: e?.message || String(e), to: ownerId, messageId });
-        }
+
+        await sendInternalPush({
+          kind: "reaction",
+          to_user_id: ownerId,
+          from_user_id: me.id,
+          type: "reaction",
+          title: `${me.nickname} поставил ${emoji}`,
+          body: cut,
+          data: {
+            context: "global",
+            kind: "global",
+            reaction: String(reaction),
+            message_id: String(messageId),
+            from_user_id: String(me.id),
+            from_nickname: String(me.nickname),
+          },
+        });
       }
     }
 
@@ -1341,7 +1114,7 @@ app.get("/chat/dm/:conversation_id/history", authenticateToken, async (req, res)
   }
 });
 
-// -------------------- DM SEND (reply_to_id + mentions + mute-aware push) --------------------
+// -------------------- DM SEND (reply_to_id + mentions + push via notification-service) --------------------
 app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -1454,27 +1227,24 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
 
     log("info", "dm.event.sse.sent", { msgId, convId: conversationId, source: "direct", toLow, toHigh });
 
-    // push receiver (mute-aware + settings-aware)
-    try {
-      await maybeSendDmPush(otherId, req.user.uid, {
-        type: "dm",
-        title: `Сообщение от ${myNick}`,
-        body: body.length > 120 ? body.slice(0, 120) + "…" : body,
-        data: {
-          context: "dm",
-          kind: "dm",
-          conversation_id: conversationId,
-          sender_user_id: String(req.user.uid),
-          sender_nickname: String(myNick),
-
-          // ✅ for local mute fallback on device
-          from_user_id: String(req.user.uid),
-          from_nickname: String(myNick),
-        },
-      });
-    } catch (e) {
-      log("warn", "push.send.failed", { err: e?.message || String(e) });
-    }
+    // push receiver (mute/settings — в notification-service)
+    await sendInternalPush({
+      kind: "dm",
+      to_user_id: otherId,
+      from_user_id: req.user.uid,
+      type: "dm",
+      title: `Сообщение от ${myNick}`,
+      body: body.length > 120 ? body.slice(0, 120) + "…" : body,
+      data: {
+        context: "dm",
+        kind: "dm",
+        conversation_id: conversationId,
+        sender_user_id: String(req.user.uid),
+        sender_nickname: String(myNick),
+        from_user_id: String(req.user.uid),
+        from_nickname: String(myNick),
+      },
+    });
 
     res.status(201).json({
       message: "sent",
@@ -1489,7 +1259,7 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
   }
 });
 
-// -------------------- DM REACT (+ reaction push) --------------------
+// -------------------- DM REACT (+ reaction push via notification-service) --------------------
 app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
@@ -1539,31 +1309,30 @@ app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateTok
       );
     }
 
-    // ✅ push на новую реакцию (👍 или 👎), если не себе
     if (reaction !== 0 && reaction !== prevReaction && ownerId !== req.user.uid) {
       const me = await getUserBasic(req.user.uid);
       if (me) {
         const snippet = String(msg.rows[0].body || "");
         const cut = snippet.length > 140 ? snippet.slice(0, 140) + "…" : snippet;
         const emoji = reaction === 1 ? "👍" : "👎";
-        try {
-          await maybeSendReactionPush(ownerId, {
-            type: "reaction",
-            title: `${me.nickname} поставил ${emoji}`,
-            body: cut,
-            data: {
-              context: "dm",
-              kind: "dm",
-              reaction: String(reaction),
-              conversation_id: String(conversationId),
-              message_id: String(messageId),
-              from_user_id: String(me.id),
-              from_nickname: String(me.nickname),
-            },
-          });
-        } catch (e) {
-          log("warn", "push.reaction.failed", { err: e?.message || String(e), to: ownerId, messageId, conversationId });
-        }
+
+        await sendInternalPush({
+          kind: "reaction",
+          to_user_id: ownerId,
+          from_user_id: me.id,
+          type: "reaction",
+          title: `${me.nickname} поставил ${emoji}`,
+          body: cut,
+          data: {
+            context: "dm",
+            kind: "dm",
+            reaction: String(reaction),
+            conversation_id: String(conversationId),
+            message_id: String(messageId),
+            from_user_id: String(me.id),
+            from_nickname: String(me.nickname),
+          },
+        });
       }
     }
 
@@ -1574,40 +1343,76 @@ app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateTok
   }
 });
 
-// -------------------- CONTACTS (unread_count + muted) --------------------
+// -------------------- CONTACTS (unread_count + muted if table exists) --------------------
 app.get("/chat/contacts", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
+  const qWithMute = `
+    SELECT
+      c.contact_user_id,
+      c.conversation_id,
+      c.last_message_id,
+      c.last_read_message_id,
+      c.last_at,
+      u.nickname,
+      COALESCE(m.muted, false) AS muted,
+      (
+        SELECT COUNT(*)::int
+        FROM dm_messages mm
+        WHERE mm.conversation_id = c.conversation_id
+          AND mm.sender_user_id = c.contact_user_id
+          AND mm.id > COALESCE(c.last_read_message_id, 0)
+      ) AS unread_count
+    FROM dm_contacts c
+    JOIN users u ON u.id = c.contact_user_id
+    LEFT JOIN dm_mutes m
+      ON m.owner_user_id = c.owner_user_id
+     AND m.muted_user_id = c.contact_user_id
+    WHERE c.owner_user_id = $1
+    ORDER BY c.last_at DESC NULLS LAST
+    LIMIT 200
+  `;
+
+  const qNoMute = `
+    SELECT
+      c.contact_user_id,
+      c.conversation_id,
+      c.last_message_id,
+      c.last_read_message_id,
+      c.last_at,
+      u.nickname,
+      false AS muted,
+      (
+        SELECT COUNT(*)::int
+        FROM dm_messages mm
+        WHERE mm.conversation_id = c.conversation_id
+          AND mm.sender_user_id = c.contact_user_id
+          AND mm.id > COALESCE(c.last_read_message_id, 0)
+      ) AS unread_count
+    FROM dm_contacts c
+    JOIN users u ON u.id = c.contact_user_id
+    WHERE c.owner_user_id = $1
+    ORDER BY c.last_at DESC NULLS LAST
+    LIMIT 200
+  `;
+
   try {
-    const r = await pool.query(
-      `SELECT
-         c.contact_user_id,
-         c.conversation_id,
-         c.last_message_id,
-         c.last_read_message_id,
-         c.last_at,
-         u.nickname,
-         COALESCE(m.muted, false) AS muted,
-         (
-           SELECT COUNT(*)::int
-           FROM dm_messages mm
-           WHERE mm.conversation_id = c.conversation_id
-             AND mm.sender_user_id = c.contact_user_id
-             AND mm.id > COALESCE(c.last_read_message_id, 0)
-         ) AS unread_count
-       FROM dm_contacts c
-       JOIN users u ON u.id = c.contact_user_id
-       LEFT JOIN dm_mutes m
-         ON m.owner_user_id = c.owner_user_id
-        AND m.muted_user_id = c.contact_user_id
-       WHERE c.owner_user_id = $1
-       ORDER BY c.last_at DESC NULLS LAST
-       LIMIT 200`,
-      [req.user.uid]
-    );
+    let rows;
+    try {
+      const r = await pool.query(qWithMute, [req.user.uid]);
+      rows = r.rows;
+    } catch (e) {
+      const msg = String(e?.message || "");
+      if (msg.includes("dm_mutes") && msg.includes("does not exist")) {
+        const r2 = await pool.query(qNoMute, [req.user.uid]);
+        rows = r2.rows;
+      } else {
+        throw e;
+      }
+    }
 
     res.json({
-      contacts: r.rows.map((x) => ({
+      contacts: rows.map((x) => ({
         contact_user_id: x.contact_user_id,
         nickname: x.nickname,
         header: `${x.nickname}#${x.contact_user_id}`,
@@ -1658,125 +1463,6 @@ app.post("/chat/dm/:conversation_id/read", authenticateToken, async (req, res) =
     res.json({ ok: true, conversation_id: conversationId, last_read_message_id });
   } catch (e) {
     log("error", "dm.read.failed", { err: e?.message || String(e), conversationId });
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-// -------------------- DM MUTE (toggle push from this contact) --------------------
-app.get("/chat/dm/:conversation_id/mute", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-  const conversationId = req.params.conversation_id;
-
-  try {
-    const pair = await pool.query(
-      `SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1`,
-      [conversationId]
-    );
-    if (!pair.rows.length) return res.status(404).json({ error: "Conversation not found" });
-
-    const { user_low, user_high } = pair.rows[0];
-    if (req.user.uid !== user_low && req.user.uid !== user_high) return res.status(403).json({ error: "Not a member of this conversation" });
-
-    const otherId = req.user.uid === user_low ? user_high : user_low;
-
-    const r = await pool.query(
-      `SELECT muted
-       FROM dm_mutes
-       WHERE owner_user_id = $1 AND muted_user_id = $2
-       LIMIT 1`,
-      [req.user.uid, otherId]
-    );
-
-    const muted = r.rows[0]?.muted === true;
-
-    res.json({
-      ok: true,
-      conversation_id: conversationId,
-      contact_user_id: otherId,
-      muted,
-      muted_user_id: otherId,
-      mute: muted,
-    });
-  } catch (e) {
-    log("error", "dm.mute.get.failed", { err: e?.message || String(e), conversationId });
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-app.post("/chat/dm/:conversation_id/mute", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-  const conversationId = req.params.conversation_id;
-  const muted = parseBool((req.body?.muted ?? req.body?.mute), true);
-
-  try {
-    const pair = await pool.query(
-      `SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1`,
-      [conversationId]
-    );
-    if (!pair.rows.length) return res.status(404).json({ error: "Conversation not found" });
-
-    const { user_low, user_high } = pair.rows[0];
-    if (req.user.uid !== user_low && req.user.uid !== user_high) return res.status(403).json({ error: "Not a member of this conversation" });
-
-    const otherId = req.user.uid === user_low ? user_high : user_low;
-
-    await pool.query(
-      `INSERT INTO dm_mutes (owner_user_id, muted_user_id, muted, updated_at)
-       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-       ON CONFLICT (owner_user_id, muted_user_id)
-       DO UPDATE SET muted = EXCLUDED.muted, updated_at = CURRENT_TIMESTAMP`,
-      [req.user.uid, otherId, muted]
-    );
-
-    res.json({
-      ok: true,
-      conversation_id: conversationId,
-      contact_user_id: otherId,
-      muted,
-      muted_user_id: otherId,
-      mute: muted,
-    });
-  } catch (e) {
-    log("error", "dm.mute.set.failed", { err: e?.message || String(e), conversationId });
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-// -------------------- NOTIFICATIONS SUMMARY --------------------
-app.get("/notifications/summary", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-
-  try {
-    const dm = await pool.query(
-      `SELECT
-         COUNT(*) FILTER (WHERE u.unread_count > 0)::int AS dm_unread_threads,
-         COALESCE(SUM(u.unread_count), 0)::int AS dm_unread_messages
-       FROM dm_contacts c
-       LEFT JOIN LATERAL (
-         SELECT COUNT(*)::int AS unread_count
-         FROM dm_messages m
-         WHERE m.conversation_id = c.conversation_id
-           AND m.sender_user_id = c.contact_user_id
-           AND m.id > COALESCE(c.last_read_message_id, 0)
-       ) u ON true
-       WHERE c.owner_user_id = $1`,
-      [req.user.uid]
-    );
-
-    const gr = await pool.query(`SELECT last_read_id FROM global_reads WHERE user_id = $1 LIMIT 1`, [req.user.uid]);
-    const lastRead = gr.rows.length ? Number(gr.rows[0].last_read_id) : 0;
-
-    const g = await pool.query(`SELECT COUNT(*)::int AS cnt FROM global_messages WHERE id > $1`, [lastRead]);
-    const m = await pool.query(`SELECT COUNT(*)::int AS cnt FROM mails WHERE to_user_id = $1 AND status = 'unread'`, [req.user.uid]);
-
-    res.json({
-      dm_unread_threads: dm.rows[0]?.dm_unread_threads ?? 0,
-      dm_unread_messages: dm.rows[0]?.dm_unread_messages ?? 0,
-      global_unread: g.rows[0].cnt,
-      mail_unread: m.rows[0].cnt,
-    });
-  } catch (e) {
-    log("error", "notifications.summary.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -2055,7 +1741,7 @@ async function startSubscriber() {
 
 // -------------------- START --------------------
 async function main() {
-  log("info", "boot", { instance: INSTANCE, port: PORT, log_level: LOG_LEVEL, has_firebase_json: !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON });
+  log("info", "boot", { instance: INSTANCE, port: PORT, log_level: LOG_LEVEL, notif_url: NOTIFICATION_URL });
   await initDbForever();
   app.listen(PORT, () => log("info", "http.listening", { port: PORT, instance: INSTANCE }));
 }

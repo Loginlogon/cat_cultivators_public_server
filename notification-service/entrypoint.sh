@@ -34,9 +34,11 @@ fi
 # --- App secrets ---
 ACCESS_SECRET="$(read_secret ACCESS_SECRET)"
 ADMIN_SECRET_KEY="$(read_secret ADMIN_SECRET_KEY)"
+FIREBASE_SERVICE_ACCOUNT_JSON="$(read_secret FIREBASE_SERVICE_ACCOUNT_JSON)"
 
 if [ -n "$ACCESS_SECRET" ]; then export ACCESS_SECRET; fi
 if [ -n "$ADMIN_SECRET_KEY" ]; then export ADMIN_SECRET_KEY; fi
+if [ -n "$FIREBASE_SERVICE_ACCOUNT_JSON" ]; then export FIREBASE_SERVICE_ACCOUNT_JSON; fi
 
 if [ "$#" -eq 0 ]; then
   set -- node server.js
