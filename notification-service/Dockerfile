@@ -3,14 +3,11 @@ FROM node:20-alpine
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev || npm install --production
+RUN npm ci --omit=dev || npm install --omit=dev
 
 COPY . .
 
-RUN chmod +x /app/entrypoint.sh
+RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 EXPOSE 3002
-
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["node", "server.js"]
-

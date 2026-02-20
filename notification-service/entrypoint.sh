@@ -1,47 +1,49 @@
 #!/bin/sh
 set -eu
 
-read_secret() {
+SECRETS_DIR="/run/secrets"
+
+read_secret_trim() {
   name="$1"
-  path="/run/secrets/$name"
+  path="${SECRETS_DIR}/${name}"
   if [ -f "$path" ]; then
-    cat "$path" | tr -d '\r'
-  else
-    echo ""
+    cat "$path" | tr -d '\r' | tr -d '\n'
+    return 0
   fi
+  return 1
 }
 
-# --- DB secrets ---
-DB_USER="$(read_secret DB_USER)"
-DB_PASSWORD="$(read_secret DB_PASSWORD)"
-DB_NAME="$(read_secret DB_NAME)"
-
-if [ -n "$DB_USER" ]; then export DB_USER; fi
-if [ -n "$DB_PASSWORD" ]; then export DB_PASSWORD; fi
-if [ -n "$DB_NAME" ]; then export DB_NAME; fi
-
-# Build DATABASE_URL for node (pg)
-if [ -n "${DATABASE_URL:-}" ]; then
-  :
-else
-  if [ -z "$DB_USER" ] || [ -z "$DB_PASSWORD" ] || [ -z "$DB_NAME" ]; then
-    echo "❌ Missing DB secrets (DB_USER/DB_PASSWORD/DB_NAME) to build DATABASE_URL" >&2
-    exit 1
+read_secret_raw() {
+  name="$1"
+  path="${SECRETS_DIR}/${name}"
+  if [ -f "$path" ]; then
+    cat "$path" | tr -d '\r'
+    return 0
   fi
-  export DATABASE_URL="postgres://${DB_USER}:${DB_PASSWORD}@db:5432/${DB_NAME}"
+  return 1
+}
+
+export ACCESS_SECRET="${ACCESS_SECRET:-$(read_secret_trim ACCESS_SECRET 2>/dev/null || echo "")}"
+export ADMIN_SECRET_KEY="${ADMIN_SECRET_KEY:-$(read_secret_trim ADMIN_SECRET_KEY 2>/dev/null || echo "")}"
+
+export DB_USER="${DB_USER:-$(read_secret_trim DB_USER 2>/dev/null || echo "")}"
+export DB_PASSWORD="${DB_PASSWORD:-$(read_secret_trim DB_PASSWORD 2>/dev/null || echo "")}"
+export DB_NAME="${DB_NAME:-$(read_secret_trim DB_NAME 2>/dev/null || echo "")}"
+
+# Firebase JSON именно как env (у тебя код читает process.env напрямую)
+if [ -z "${FIREBASE_SERVICE_ACCOUNT_JSON:-}" ]; then
+  export FIREBASE_SERVICE_ACCOUNT_JSON="$(read_secret_raw FIREBASE_SERVICE_ACCOUNT_JSON 2>/dev/null || echo "")"
 fi
 
-# --- App secrets ---
-ACCESS_SECRET="$(read_secret ACCESS_SECRET)"
-ADMIN_SECRET_KEY="$(read_secret ADMIN_SECRET_KEY)"
-FIREBASE_SERVICE_ACCOUNT_JSON="$(read_secret FIREBASE_SERVICE_ACCOUNT_JSON)"
+: "${DB_HOST:=db}"
+: "${DB_PORT:=5432}"
 
-if [ -n "$ACCESS_SECRET" ]; then export ACCESS_SECRET; fi
-if [ -n "$ADMIN_SECRET_KEY" ]; then export ADMIN_SECRET_KEY; fi
-if [ -n "$FIREBASE_SERVICE_ACCOUNT_JSON" ]; then export FIREBASE_SERVICE_ACCOUNT_JSON; fi
-
-if [ "$#" -eq 0 ]; then
-  set -- node server.js
+if [ -z "${DATABASE_URL:-}" ]; then
+  if [ -n "${DB_USER}" ] && [ -n "${DB_PASSWORD}" ] && [ -n "${DB_NAME}" ]; then
+    export DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+  fi
 fi
 
-exec "$@"
+echo "[entrypoint] notification-service starting; PORT=${PORT:-3002} DB_HOST=${DB_HOST} DB_NAME=${DB_NAME} has_firebase_json=$([ -n "${FIREBASE_SERVICE_ACCOUNT_JSON:-}" ] && echo yes || echo no)"
+
+exec node server.js
