@@ -76,6 +76,26 @@ services:
       db:
         condition: service_healthy
 
+  realtime-service:
+    build: ./realtime-service
+    restart: always
+    ports:
+      - "3003:3003"
+    secrets:
+      - ACCESS_SECRET
+      - DB_USER
+      - DB_PASSWORD
+      - DB_NAME
+    environment:
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: debug
+      PORT: 3003
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   game-mail:
     build: ./game-mail-service
     restart: always
@@ -93,12 +113,15 @@ services:
       SSE_DEBUG: "1"
       PORT: 3001
       NOTIFICATION_URL: http://notification-service:3002
+      REALTIME_URL: http://realtime-service:3003
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
       notification-service:
+        condition: service_started
+      realtime-service:
         condition: service_started
 
   adminer:

@@ -4,20 +4,17 @@ const express = require("express");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
 const { v4: uuidv4 } = require("uuid");
-const createSubscriber = require("pg-listen");
-const Redis = require("ioredis");
 const { readEnv } = require("./env");
 
 // -------------------- CONFIG --------------------
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-let ACCESS_SECRET, ADMIN_SECRET_KEY, DATABASE_URL, REDIS_URL, PORT, LOG_LEVEL;
+let ACCESS_SECRET, ADMIN_SECRET_KEY, DATABASE_URL, PORT, LOG_LEVEL;
 try {
   ACCESS_SECRET = readEnv("ACCESS_SECRET");
   ADMIN_SECRET_KEY = readEnv("ADMIN_SECRET_KEY", { required: false, allowEmpty: true }) || "";
   DATABASE_URL = readEnv("DATABASE_URL");
-  REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
   PORT = Number(process.env.PORT || 3001);
   LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
 } catch (e) {
@@ -29,6 +26,7 @@ const INSTANCE = process.env.INSTANCE_ID || require("os").hostname();
 
 // куда проксировать уведомления
 const NOTIFICATION_URL = (process.env.NOTIFICATION_URL || "http://notification-service:3002").replace(/\/+$/, "");
+const REALTIME_URL = (process.env.REALTIME_URL || "http://realtime-service:3003").replace(/\/+$/, "");
 
 // -------------------- LOGGER --------------------
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -60,63 +58,8 @@ app.use((req, res, next) => {
 const pool = new Pool({ connectionString: DATABASE_URL });
 pool.on("error", (err) => log("error", "pg.pool.error", { err: err?.message || String(err) }));
 
-// -------------------- REDIS (presence) --------------------
-const redis = new Redis(REDIS_URL, { enableAutoPipelining: false, lazyConnect: true });
-redis.on("error", (e) => log("error", "redis.error", { err: e?.message || String(e) }));
-
-let redisConnectPromise = null;
-async function ensureRedisConnected() {
-  try {
-    if (redis.status === "ready") return true;
-    if (redisConnectPromise) return redisConnectPromise;
-
-    redisConnectPromise = redis
-      .connect()
-      .then(() => {
-        log("info", "redis.connected", { url: "REDIS_URL", status: redis.status });
-        return true;
-      })
-      .catch((e) => {
-        log("error", "redis.connect.failed", { err: e?.message || String(e), status: redis.status });
-        return false;
-      })
-      .finally(() => {
-        redisConnectPromise = null;
-      });
-
-    return redisConnectPromise;
-  } catch (e) {
-    log("error", "redis.connect.failed", { err: e?.message || String(e), status: redis.status });
-    return false;
-  }
-}
-
-const PRESENCE_TTL_SEC = Number(process.env.PRESENCE_TTL_SEC || 60);
-function presenceKey(uid) {
-  return `online:${uid}`;
-}
 async function touchPresence(uid) {
-  const ok = await ensureRedisConnected();
-  if (!ok || redis.status !== "ready") return;
-  await redis.set(presenceKey(uid), "1", "EX", PRESENCE_TTL_SEC);
-}
-async function isOnline(uid) {
-  const ok = await ensureRedisConnected();
-  if (!ok || redis.status !== "ready") return false;
-  const v = await redis.get(presenceKey(uid));
-  return v !== null;
-}
-async function onlineBatch(ids) {
-  const ok = await ensureRedisConnected();
-  if (!ok || redis.status !== "ready") return [];
-
-  const unique = Array.from(new Set(ids.map(Number).filter((x) => Number.isInteger(x) && x > 0))).slice(0, 200);
-  if (!unique.length) return [];
-
-  const pipe = redis.pipeline();
-  for (const id of unique) pipe.get(presenceKey(id));
-  const results = await pipe.exec();
-  return unique.map((id, idx) => ({ user_id: id, online: results[idx]?.[1] !== null }));
+  void uid;
 }
 
 // -------------------- HELPERS --------------------
@@ -133,6 +76,22 @@ const parseBool = (v, def) => {
   if (["0", "false", "no", "n", "off"].includes(s)) return false;
   return def;
 };
+
+// stickers helpers
+function normalizeStickerPackCode(v) {
+  return String(v || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+}
+
+function validateStickerPackCode(code) {
+  return /^[a-z0-9][a-z0-9._-]{0,63}$/.test(code);
+}
+
+function normalizeStickerString(v) {
+  return String(v ?? "").trim();
+}
 
 const requireAdmin = (req, res, next) => {
   const key = req.headers["x-admin-key"];
@@ -184,6 +143,34 @@ async function proxyToNotification(req, res) {
   } catch (e) {
     log("error", "proxy.notification.failed", { err: e?.message || String(e), path: req.originalUrl });
     res.status(502).json({ error: "notification-service unavailable" });
+  }
+}
+
+async function proxyToRealtime(req, res) {
+  try {
+    const target = new URL(REALTIME_URL + req.originalUrl);
+
+    const headers = {};
+    if (req.headers.authorization) headers["authorization"] = req.headers.authorization;
+    headers["content-type"] = "application/json; charset=utf-8";
+
+    const method = req.method.toUpperCase();
+    const hasBody = !["GET", "HEAD"].includes(method);
+
+    const r = await fetch(target.toString(), {
+      method,
+      headers,
+      body: hasBody ? JSON.stringify(req.body ?? {}) : undefined,
+    });
+
+    const text = await r.text();
+    const ct = r.headers.get("content-type");
+    if (ct) res.setHeader("content-type", ct);
+
+    res.status(r.status).send(text);
+  } catch (e) {
+    log("error", "proxy.realtime.failed", { err: e?.message || String(e), path: req.originalUrl });
+    res.status(502).json({ error: "realtime-service unavailable" });
   }
 }
 
@@ -264,77 +251,7 @@ async function resolveMentions(text) {
   return Array.from(new Set(ok)).slice(0, 20);
 }
 
-// -------------------- SSE --------------------
-const sseClients = new Map(); // userId -> Set<entry>
-let sseConnSeq = 0;
-
-function addSseClient(userId, res, scope) {
-  const uid = Number(userId);
-  if (!sseClients.has(uid)) sseClients.set(uid, new Set());
-  const entry = { res, scope, connId: ++sseConnSeq, createdAt: Date.now() };
-  sseClients.get(uid).add(entry);
-  log("info", "sse.client.add", { uid, scope, connId: entry.connId, totalForUser: sseClients.get(uid).size });
-  return entry;
-}
-
-function removeSseClient(userId, entry, reason) {
-  const uid = Number(userId);
-  const set = sseClients.get(uid);
-  if (!set) return;
-  set.delete(entry);
-  if (set.size === 0) sseClients.delete(uid);
-  log("info", "sse.client.remove", { uid, scope: entry.scope, connId: entry.connId, reason: reason || "unknown" });
-}
-
-function sseSend(res, obj, id = null) {
-  const data = JSON.stringify(obj);
-  if (id !== null && id !== undefined) res.write(`id: ${String(id)}\n`);
-  res.write(`data: ${data}\n\n`);
-}
-function sseComment(res, text) {
-  res.write(`: ${text}\n\n`);
-}
-function safeJson(s) {
-  try { return JSON.parse(s); } catch (_) { return { raw: s }; }
-}
-function broadcastToUser(uid, payload, scopeFilterFn = null, id = null) {
-  const set = sseClients.get(Number(uid));
-  if (!set) return 0;
-  let sent = 0;
-  for (const entry of set) {
-    if (scopeFilterFn && !scopeFilterFn(entry.scope)) continue;
-    try {
-      sseSend(entry.res, payload, id);
-      sent++;
-    } catch (e) {
-      try { entry.res.end(); } catch (_) {}
-      removeSseClient(uid, entry, "write_failed");
-    }
-  }
-  return sent;
-}
-
-// -------------------- DEDUPE (SSE notify) --------------------
-const RECENT_TTL_MS = Number(process.env.RECENT_TTL_MS || 10000);
-const recentGlobal = new Map();
-const recentDm = new Map();
-
-function markRecent(map, key) { map.set(String(key), Date.now()); }
-function wasRecent(map, key) {
-  const k = String(key);
-  const ts = map.get(k);
-  if (!ts) return false;
-  if (Date.now() - ts < RECENT_TTL_MS) return true;
-  map.delete(k);
-  return false;
-}
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, ts] of recentGlobal.entries()) if (now - ts > RECENT_TTL_MS) recentGlobal.delete(k);
-  for (const [k, ts] of recentDm.entries()) if (now - ts > RECENT_TTL_MS) recentDm.delete(k);
-}, 5000).unref?.();
-
-// -------------------- DB: triggers for NOTIFY (for SSE sync between instances) --------------------
+// -------------------- DB: triggers for NOTIFY (for realtime-service) --------------------
 async function ensureNotifyTriggers(client) {
   await client.query(`
     CREATE OR REPLACE FUNCTION notify_global_message() RETURNS trigger AS $$
@@ -395,8 +312,6 @@ async function ensureNotifyTriggers(client) {
 }
 
 // -------------------- DB INIT + "soft migrations" --------------------
-let subscriberStarted = false;
-
 async function initDbForever() {
   while (true) {
     const client = await pool.connect();
@@ -518,15 +433,82 @@ async function initDbForever() {
       `);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_reactions_msg ON dm_reactions(message_id);`);
 
+      // -------------------- STICKERS (packs + items + grants) --------------------
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS sticker_packs (
+          id SERIAL PRIMARY KEY,
+          code TEXT NOT NULL UNIQUE,
+          title TEXT NOT NULL,
+          is_default BOOLEAN NOT NULL DEFAULT false,
+          is_active BOOLEAN NOT NULL DEFAULT true,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      await client.query(`ALTER TABLE sticker_packs ADD COLUMN IF NOT EXISTS code TEXT;`);
+      await client.query(`ALTER TABLE sticker_packs ADD COLUMN IF NOT EXISTS title TEXT;`);
+      await client.query(`ALTER TABLE sticker_packs ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT false;`);
+      await client.query(`ALTER TABLE sticker_packs ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;`);
+      await client.query(`ALTER TABLE sticker_packs ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;`);
+
+      await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_sticker_packs_code ON sticker_packs(code);`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_sticker_packs_active ON sticker_packs(is_active, id);`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_sticker_packs_default ON sticker_packs(is_default, id);`);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS sticker_pack_items (
+          id BIGSERIAL PRIMARY KEY,
+          pack_id INTEGER NOT NULL REFERENCES sticker_packs(id) ON DELETE CASCADE,
+          value TEXT NOT NULL,
+          sort_order INTEGER NOT NULL DEFAULT 0,
+          is_active BOOLEAN NOT NULL DEFAULT true,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      await client.query(`ALTER TABLE sticker_pack_items ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0;`);
+      await client.query(`ALTER TABLE sticker_pack_items ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;`);
+      await client.query(`ALTER TABLE sticker_pack_items ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;`);
+
+      await client.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_sticker_pack_items_pack_value
+        ON sticker_pack_items(pack_id, value);
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_sticker_pack_items_pack_sort
+        ON sticker_pack_items(pack_id, is_active, sort_order, id);
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS user_sticker_packs (
+          user_id INTEGER NOT NULL,
+          pack_id INTEGER NOT NULL REFERENCES sticker_packs(id) ON DELETE CASCADE,
+          granted_by_user_id INTEGER,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (user_id, pack_id)
+        );
+      `);
+
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_user_sticker_packs_user
+        ON user_sticker_packs(user_id, pack_id);
+      `);
+
+      // Гарантируем наличие дефолтного пака (доступен всем автоматически)
+      await client.query(`
+        INSERT INTO sticker_packs (code, title, is_default, is_active)
+        VALUES ('default', 'Default', true, true)
+        ON CONFLICT (code)
+        DO UPDATE SET
+          title = EXCLUDED.title,
+          is_default = true,
+          is_active = true
+      `);
+
       await ensureNotifyTriggers(client);
 
       await client.query("COMMIT");
       log("info", "db.ready");
-
-      if (!subscriberStarted) {
-        subscriberStarted = true;
-        startSubscriber().catch((e) => log("error", "subscriber.start.failed", { err: e?.message || String(e) }));
-      }
 
       return;
     } catch (err) {
@@ -539,43 +521,8 @@ async function initDbForever() {
   }
 }
 
-// -------------------- SSE endpoint --------------------
-app.get("/events", authenticateToken, async (req, res) => {
-  const scope = (req.query.scope || "global").toString();
-
-  res.status(200);
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-  res.flushHeaders?.();
-
-  await touchPresence(req.user.uid);
-
-  try { res.write(`retry: 3000\n\n`); } catch (_) {}
-
-  const entry = addSseClient(req.user.uid, res, scope);
-
-  sseSend(res, {
-    type: "hello",
-    ok: true,
-    scope,
-    server_time: new Date().toISOString(),
-    instance: INSTANCE,
-  });
-
-  const ka = setInterval(async () => {
-    try {
-      sseComment(res, `keepalive ${Date.now()}`);
-      await touchPresence(req.user.uid);
-    } catch (_) {}
-  }, 10000);
-
-  req.on("close", () => {
-    clearInterval(ka);
-    removeSseClient(req.user.uid, entry, "client_close");
-  });
-});
+// -------------------- REALTIME ROUTES (PROXY) --------------------
+app.get("/events", authenticateToken, proxyToRealtime);
 
 // -------------------- BASIC ROUTES --------------------
 app.get("/ping", (req, res) => {
@@ -596,31 +543,9 @@ app.post("/chat/dm/:conversation_id/mute", authenticateToken, proxyToNotificatio
 
 app.get("/notifications/summary", authenticateToken, proxyToNotification);
 
-// -------------------- Presence --------------------
-app.post("/presence/offline", authenticateToken, async (req, res) => {
-  try {
-    const ok = await ensureRedisConnected();
-    if (ok && redis.status === "ready") await redis.del(presenceKey(req.user.uid));
-  } catch (_) {}
-  res.json({ ok: true });
-});
-
-app.get("/presence/online/:userId", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-
-  const userId = Number(req.params.userId);
-  if (!Number.isInteger(userId) || userId <= 0) return res.status(400).json({ error: "bad userId" });
-
-  const online = await isOnline(userId);
-  res.json({ user_id: userId, online });
-});
-
-app.get("/presence/online-batch", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-  const ids = (req.query.ids || "").toString().split(",").map((x) => Number(x.trim()));
-  const online = await onlineBatch(ids);
-  res.json({ online });
-});
+app.post("/presence/offline", authenticateToken, proxyToRealtime);
+app.get("/presence/online/:userId", authenticateToken, proxyToRealtime);
+app.get("/presence/online-batch", authenticateToken, proxyToRealtime);
 
 // -------------------- USERS SEARCH --------------------
 app.get("/users/search", authenticateToken, async (req, res) => {
@@ -656,6 +581,287 @@ app.get("/users/search", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Database error" });
   }
 });
+
+// -------------------- STICKERS --------------------
+
+// Admin: список паков (чтобы удобно получать pack_id, включая default)
+app.get("/admin/stickers/packs", requireAdmin, async (req, res) => {
+  try {
+    const rows = await pool.query(
+      `
+      SELECT
+        p.id, p.code, p.title, p.is_default, p.is_active, p.created_at,
+        COALESCE(cnt.items_count, 0)::int AS items_count
+      FROM sticker_packs p
+      LEFT JOIN (
+        SELECT pack_id, COUNT(*)::int AS items_count
+        FROM sticker_pack_items
+        WHERE is_active = true
+        GROUP BY pack_id
+      ) cnt ON cnt.pack_id = p.id
+      ORDER BY p.is_default DESC, p.id ASC
+      `
+    );
+
+    res.json({
+      packs: rows.rows.map((r) => ({
+        id: r.id,
+        code: r.code,
+        title: r.title,
+        is_default: r.is_default === true,
+        is_active: r.is_active === true,
+        items_count: r.items_count || 0,
+        created_at: r.created_at,
+      })),
+    });
+  } catch (e) {
+    log("error", "stickers.admin.list_packs.failed", { err: e?.message || String(e) });
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Admin: создать новый пак (не default)
+app.post("/admin/stickers/packs", requireAdmin, async (req, res) => {
+  const code = normalizeStickerPackCode(req.body?.code);
+  const title = String(req.body?.title || "").trim();
+  const is_active = parseBool(req.body?.is_active, true);
+
+  if (!code) return res.status(400).json({ error: "code required" });
+  if (!validateStickerPackCode(code)) {
+    return res.status(400).json({ error: "code format invalid (a-z0-9._-, max 64, starts with alnum)" });
+  }
+  if (!title) return res.status(400).json({ error: "title required" });
+  if (title.length > 128) return res.status(400).json({ error: "title too long (max 128)" });
+  if (code === "default") {
+    return res.status(400).json({ error: "default pack is created automatically" });
+  }
+
+  try {
+    const ins = await pool.query(
+      `
+      INSERT INTO sticker_packs (code, title, is_default, is_active)
+      VALUES ($1, $2, false, $3)
+      RETURNING id, code, title, is_default, is_active, created_at
+      `,
+      [code, title, is_active]
+    );
+
+    res.status(201).json({ pack: ins.rows[0] });
+  } catch (e) {
+    if (e?.code === "23505") {
+      return res.status(409).json({ error: "pack code already exists" });
+    }
+    log("error", "stickers.admin.create_pack.failed", { err: e?.message || String(e), code });
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Admin: добавить стикер (string) в пак
+app.post("/admin/stickers/packs/:pack_id/stickers", requireAdmin, async (req, res) => {
+  const packId = Number(req.params.pack_id);
+  const sticker = normalizeStickerString(req.body?.sticker); // string
+  const sort_order = clampInt(req.body?.sort_order, 0, -1000000, 1000000);
+  const is_active = parseBool(req.body?.is_active, true);
+
+  if (!Number.isInteger(packId) || packId <= 0) return res.status(400).json({ error: "bad pack_id" });
+  if (!sticker) return res.status(400).json({ error: "sticker required" });
+  if (sticker.length > 256) return res.status(400).json({ error: "sticker too long (max 256)" });
+
+  try {
+    const pack = await pool.query(
+      `SELECT id, code, title, is_default, is_active FROM sticker_packs WHERE id = $1 LIMIT 1`,
+      [packId]
+    );
+    if (!pack.rows.length) return res.status(404).json({ error: "pack not found" });
+
+    const ins = await pool.query(
+      `
+      INSERT INTO sticker_pack_items (pack_id, value, sort_order, is_active)
+      VALUES ($1, $2, $3, $4)
+      RETURNING id, pack_id, value, sort_order, is_active, created_at
+      `,
+      [packId, sticker, sort_order, is_active]
+    );
+
+    res.status(201).json({
+      pack: {
+        id: pack.rows[0].id,
+        code: pack.rows[0].code,
+        title: pack.rows[0].title,
+        is_default: pack.rows[0].is_default === true,
+        is_active: pack.rows[0].is_active === true,
+      },
+      sticker: {
+        id: ins.rows[0].id,
+        value: ins.rows[0].value,
+        sort_order: ins.rows[0].sort_order,
+        is_active: ins.rows[0].is_active === true,
+        created_at: ins.rows[0].created_at,
+      },
+    });
+  } catch (e) {
+    if (e?.code === "23505") {
+      return res.status(409).json({ error: "sticker already exists in this pack" });
+    }
+    log("error", "stickers.admin.add_item.failed", { err: e?.message || String(e), packId });
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Admin: выдать пак пользователю по user_id
+app.post("/admin/stickers/packs/:pack_id/grant-user", requireAdmin, async (req, res) => {
+  const packId = Number(req.params.pack_id);
+  const userId = Number(req.body?.user_id);
+
+  if (!Number.isInteger(packId) || packId <= 0) return res.status(400).json({ error: "bad pack_id" });
+  if (!Number.isInteger(userId) || userId <= 0) return res.status(400).json({ error: "user_id must be integer" });
+
+  try {
+    const u = await getUserBasic(userId);
+    if (!u) return res.status(404).json({ error: "User not found" });
+
+    const p = await pool.query(
+      `SELECT id, code, title, is_default, is_active FROM sticker_packs WHERE id = $1 LIMIT 1`,
+      [packId]
+    );
+    if (!p.rows.length) return res.status(404).json({ error: "pack not found" });
+
+    const pack = p.rows[0];
+    if (pack.is_default === true) {
+      return res.json({
+        ok: true,
+        granted: false,
+        reason: "pack_is_default_and_already_available_to_all",
+        user: { id: u.id, login: u.login, nickname: u.nickname },
+        pack: {
+          id: pack.id,
+          code: pack.code,
+          title: pack.title,
+          is_default: true,
+          is_active: pack.is_active === true,
+        },
+      });
+    }
+
+    const ins = await pool.query(
+      `
+      INSERT INTO user_sticker_packs (user_id, pack_id, granted_by_user_id)
+      VALUES ($1, $2, NULL)
+      ON CONFLICT (user_id, pack_id) DO NOTHING
+      RETURNING user_id, pack_id, created_at
+      `,
+      [userId, packId]
+    );
+
+    res.json({
+      ok: true,
+      granted: ins.rows.length > 0,
+      user: { id: u.id, login: u.login, nickname: u.nickname },
+      pack: {
+        id: pack.id,
+        code: pack.code,
+        title: pack.title,
+        is_default: pack.is_default === true,
+        is_active: pack.is_active === true,
+      },
+      created_at: ins.rows[0]?.created_at || null,
+    });
+  } catch (e) {
+    log("error", "stickers.admin.grant_pack.failed", { err: e?.message || String(e), packId, userId });
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// User: получить доступные стикеры (дефолт + выданные)
+async function handleGetAvailableStickers(req, res) {
+  await touchPresence(req.user.uid);
+
+  try {
+    const r = await pool.query(
+      `
+      SELECT
+        p.id AS pack_id,
+        p.code AS pack_code,
+        p.title AS pack_title,
+        p.is_default,
+        p.is_active,
+        p.created_at AS pack_created_at,
+
+        s.id AS sticker_id,
+        s.value AS sticker_value,
+        s.sort_order,
+        s.is_active AS sticker_is_active,
+        s.created_at AS sticker_created_at
+
+      FROM sticker_packs p
+      LEFT JOIN sticker_pack_items s
+        ON s.pack_id = p.id
+       AND s.is_active = true
+
+      WHERE p.is_active = true
+        AND (
+          p.is_default = true
+          OR EXISTS (
+            SELECT 1
+            FROM user_sticker_packs usp
+            WHERE usp.user_id = $1
+              AND usp.pack_id = p.id
+          )
+        )
+
+      ORDER BY p.is_default DESC, p.id ASC, s.sort_order ASC, s.id ASC
+      `,
+      [req.user.uid]
+    );
+
+    const packsMap = new Map();
+
+    for (const row of r.rows) {
+      let pack = packsMap.get(row.pack_id);
+      if (!pack) {
+        pack = {
+          id: row.pack_id,
+          code: row.pack_code,
+          title: row.pack_title,
+          is_default: row.is_default === true,
+          is_active: row.is_active === true,
+          created_at: row.pack_created_at,
+          stickers: [],
+        };
+        packsMap.set(row.pack_id, pack);
+      }
+
+      if (row.sticker_id !== null && row.sticker_id !== undefined) {
+        pack.stickers.push({
+          id: row.sticker_id,
+          value: row.sticker_value,
+          sort_order: row.sort_order ?? 0,
+          created_at: row.sticker_created_at,
+        });
+      }
+    }
+
+    const packs = Array.from(packsMap.values());
+    const all_stickers = [];
+    for (const p of packs) {
+      for (const s of p.stickers) all_stickers.push(s.value);
+    }
+
+    res.json({
+      user_id: req.user.uid,
+      total_packs: packs.length,
+      total_stickers: all_stickers.length,
+      packs,
+      all_stickers,
+    });
+  } catch (e) {
+    log("error", "stickers.user.available.failed", { err: e?.message || String(e), uid: req.user.uid });
+    res.status(500).json({ error: "Database error" });
+  }
+}
+
+app.get("/stickers/available", authenticateToken, handleGetAvailableStickers);
+app.get("/stickers/my", authenticateToken, handleGetAvailableStickers);
 
 // -------------------- GLOBAL CHAT HISTORY (reply + reactions + my_reaction) --------------------
 app.get("/chat/global/history", authenticateToken, async (req, res) => {
@@ -785,31 +991,6 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
 
     const msgId = insert.rows[0].id;
     const createdAt = insert.rows[0].created_at;
-
-    const payload = {
-      type: "global_message",
-      id: msgId,
-      user_id: me.id,
-      nickname: me.nickname,
-      body,
-      created_at: createdAt,
-      reply_to_id,
-      mention_user_ids: mentionIds,
-      instance: INSTANCE,
-      source: "direct",
-    };
-
-    markRecent(recentGlobal, msgId);
-
-    let sent = 0;
-    for (const [, set] of sseClients.entries()) {
-      for (const entry of set) {
-        if (entry.scope === "global") {
-          try { sseSend(entry.res, payload, msgId); sent++; } catch (_) {}
-        }
-      }
-    }
-    log("info", "global.event.sse.sent", { msgId, source: "direct", sent });
 
     // mention push (в notification-service)
     if (mentionIds.length) {
@@ -1206,27 +1387,6 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
 
     await client.query("COMMIT");
 
-    const ssePayload = {
-      type: "dm_message",
-      id: msgId,
-      conversation_id: conversationId,
-      sender_user_id: req.user.uid,
-      sender_nickname: myNick,
-      body,
-      created_at: createdAt,
-      reply_to_id,
-      mention_user_ids: mentionIds,
-      instance: INSTANCE,
-      source: "direct",
-    };
-
-    markRecent(recentDm, msgId);
-
-    const toLow = broadcastToUser(user_low, ssePayload, (scope) => scope === "dm" || scope === `dm:${conversationId}`, msgId);
-    const toHigh = broadcastToUser(user_high, ssePayload, (scope) => scope === "dm" || scope === `dm:${conversationId}`, msgId);
-
-    log("info", "dm.event.sse.sent", { msgId, convId: conversationId, source: "direct", toLow, toHigh });
-
     // push receiver (mute/settings — в notification-service)
     await sendInternalPush({
       kind: "dm",
@@ -1304,7 +1464,7 @@ app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateTok
         `INSERT INTO dm_reactions (message_id, user_id, reaction, updated_at)
          VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
          ON CONFLICT (message_id, user_id)
-         DO UPDATE SET reaction = EXCLUDED.reaction, updated_at = CURRENT_TIMESTAMP`,
+         DO UPDATE SET reaction = EXCLUDED.reaction, updated_at = EXCLUDED.updated_at`,
         [messageId, req.user.uid, reaction]
       );
     }
@@ -1637,111 +1797,9 @@ app.post("/admin/mail/send", requireAdmin, async (req, res) => {
   }
 });
 
-// -------------------- SSE + Postgres LISTEN/NOTIFY --------------------
-const subscriber = createSubscriber({ connectionString: DATABASE_URL });
-
-async function startSubscriber() {
-  try {
-    log("info", "subscriber.connecting", { url: "DATABASE_URL", instance: INSTANCE });
-
-    subscriber.notifications.on("global_messages", (payload) => {
-      log("debug", "notify.global_messages");
-      const obj = safeJson(payload);
-      const msgId = obj?.id;
-
-      if (msgId && wasRecent(recentGlobal, msgId)) {
-        log("debug", "notify.global_messages.skipped_recent", { msgId });
-        return;
-      }
-
-      const out = {
-        type: "global_message",
-        id: obj.id,
-        user_id: obj.user_id,
-        nickname: obj.nickname,
-        body: obj.body,
-        created_at: obj.created_at,
-        reply_to_id: obj.reply_to_id ?? null,
-        mention_user_ids: obj.mention_user_ids || [],
-        instance: INSTANCE,
-        source: "notify",
-      };
-
-      let sent = 0;
-      for (const [, set] of sseClients.entries()) {
-        for (const entry of set) {
-          if (entry.scope === "global") {
-            try { sseSend(entry.res, out, msgId || null); sent++; } catch (_) {}
-          }
-        }
-      }
-      log("info", "global.event.sse.sent", { msgId, source: "notify", sent });
-    });
-
-    subscriber.notifications.on("dm_messages", (payload) => {
-      log("debug", "notify.dm_messages");
-      (async () => {
-        try {
-          const obj = safeJson(payload);
-          const msgId = obj?.id;
-
-          if (msgId && wasRecent(recentDm, msgId)) {
-            log("debug", "notify.dm_messages.skipped_recent", { msgId });
-            return;
-          }
-
-          const convId = obj?.conversation_id;
-          if (!convId) return;
-
-          const r = await pool.query(
-            "SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1",
-            [convId]
-          );
-          if (!r.rows.length) return;
-
-          const { user_low, user_high } = r.rows[0];
-
-          const out = {
-            type: "dm_message",
-            id: obj.id,
-            conversation_id: convId,
-            sender_user_id: obj.sender_user_id,
-            sender_nickname: obj.sender_nickname,
-            body: obj.body,
-            created_at: obj.created_at,
-            reply_to_id: obj.reply_to_id ?? null,
-            mention_user_ids: obj.mention_user_ids || [],
-            instance: INSTANCE,
-            source: "notify",
-          };
-
-          const toLow = broadcastToUser(user_low, out, (scope) => scope === "dm" || scope === `dm:${convId}`, msgId || null);
-          const toHigh = broadcastToUser(user_high, out, (scope) => scope === "dm" || scope === `dm:${convId}`, msgId || null);
-
-          log("info", "dm.event.sse.sent", { msgId, convId, source: "notify", toLow, toHigh });
-        } catch (e) {
-          log("error", "dm.notify.handler.failed", { err: e?.message || String(e) });
-        }
-      })();
-    });
-
-    subscriber.events.on("error", (err) => log("error", "pg-listen.error", { err: err?.message || String(err) }));
-
-    await subscriber.connect();
-    await subscriber.listenTo("global_messages");
-    await subscriber.listenTo("dm_messages");
-
-    log("info", "subscriber.ready");
-  } catch (e) {
-    log("error", "subscriber.failed", { err: e?.message || String(e) });
-    await sleep(5000);
-    return startSubscriber();
-  }
-}
-
 // -------------------- START --------------------
 async function main() {
-  log("info", "boot", { instance: INSTANCE, port: PORT, log_level: LOG_LEVEL, notif_url: NOTIFICATION_URL });
+  log("info", "boot", { instance: INSTANCE, port: PORT, log_level: LOG_LEVEL, notif_url: NOTIFICATION_URL, realtime_url: REALTIME_URL });
   await initDbForever();
   app.listen(PORT, () => log("info", "http.listening", { port: PORT, instance: INSTANCE }));
 }
@@ -1749,11 +1807,4 @@ async function main() {
 main().catch((e) => {
   log("error", "fatal", { err: e?.message || String(e) });
   process.exit(1);
-});
-
-process.on("SIGINT", async () => {
-  log("warn", "sigint");
-  try { await subscriber.close(); } catch (_) {}
-  try { await redis.quit(); } catch (_) {}
-  process.exit(0);
 });
