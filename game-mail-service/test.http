@@ -1,79 +1,281 @@
+@baseUrl = http://localhost:3001
+@authUrl = http://localhost:3000
+@adminKey = put-your-admin-key-here
+@userAId = 1
+@userBId = 2
+
+@login1 = test_user_a
+@nickname1 = TesterA
+@password1 = 1234
+
+@login2 = test_user_b
+@nickname2 = TesterB
+@password2 = 1234
+
 ### Ping
-GET http://localhost:3001/ping
+GET {{baseUrl}}/ping
 
-### (вставь access token)
-@token = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjIsImxvZ2luIjoiY2F0X2N1bHRpdmF0b3JfMSIsImlhdCI6MTc3MDk4MDg4NywiZXhwIjoxNzcxMDY3Mjg3fQ.LwufyPPf4HNGX_bt0ZxqZRSFR0kpkXy4JmGWI1qBOAM
-### Global: send
-POST http://localhost:3001/chat/global/send
-Authorization: Bearer {{token}}
+### Register user A (может вернуть 409, если уже создан)
+POST {{authUrl}}/register
 Content-Type: application/json
 
 {
-  "body": "хаааааи1"
+  "login": "{{login1}}",
+  "nickname": "{{nickname1}}",
+  "password": "{{password1}}"
 }
 
-### Global: history
-GET http://localhost:3001/chat/global/history?limit=100
-Authorization: Bearer {{token}}
-
-### Search users by nickname prefix
-GET http://localhost:3001/users/search?nickname=Кот-1&limit=20
-Authorization: Bearer {{token}}
-
-
-### DM: start
-POST http://localhost:3001/chat/dm/start
-Authorization: Bearer {{token}}
+### Register user B (может вернуть 409, если уже создан)
+POST {{authUrl}}/register
 Content-Type: application/json
 
 {
-  "contact_user_id": 1
+  "login": "{{login2}}",
+  "nickname": "{{nickname2}}",
+  "password": "{{password2}}"
 }
 
-### DM: history
-GET http://localhost:3001/chat/dm/d911e582-2958-4d50-ad83-3712355038b4/history?limit=50
-Authorization: Bearer {{token}}
-
-### DM: send
-POST http://localhost:3001/chat/dm/5c8cf57f-e3c3-436f-8cc9-b9defc4862d6/send
-Authorization: Bearer {{token}}
+### Login A
+# @name loginA
+POST {{authUrl}}/login
 Content-Type: application/json
 
 {
-  "body": "Привет в личку!fsdsdf"
+  "login": "{{login1}}",
+  "password": "{{password1}}"
 }
 
-### Contacts
-GET http://localhost:3001/chat/contacts
-Authorization: Bearer {{token}}
+@tokenA = {{loginA.response.body.$.access_token}}
 
-### Mail: inbox
-GET http://localhost:3001/mail/inbox?limit=50
-Authorization: Bearer {{token}}
-
-
-### Mail: open full mail (subject + body + reward_json)
-GET http://localhost:3001/mail/901e0915-c039-4b0f-87c3-da19dffc303d
-Authorization: Bearer {{token}}
-
-
-### Mail: read (auto-read in GET /mail/:id too)
-POST http://localhost:3001/mail/0bc11ecb-a385-4d50-b500-c0cb18f1f4fc/read
-Authorization: Bearer {{token}}
-
-### Mail: claim (optional Idempotency-Key)
-POST http://localhost:3001/mail/0bc11ecb-a385-4d50-b500-c0cb18f1f4fc/claim
-Authorization: Bearer {{token}}
-Idempotency-Key: 0a6f1a1c-0a0c-4eaa-9a7a-9f3bdc8c2f30
-
-### Admin: send mail (x-admin-key)
-POST http://localhost:3001/admin/mail/send
+### Login B
+# @name loginB
+POST {{authUrl}}/login
 Content-Type: application/json
-x-admin-key: YOUR_ADMIN_SECRET_KEY
 
 {
-  "to_user_id": 2,
-  "subject": "Награда за вход",
-  "body": "Держи деньги!",
-  "reward_json": { "money_mortals": 1000 }
+  "login": "{{login2}}",
+  "password": "{{password2}}"
 }
+
+@tokenB = {{loginB.response.body.$.access_token}}
+
+### Resolve user B id by login
+# @name userBRegDate
+GET {{authUrl}}/user/reg-date/{{login2}}
+Accept: application/json
+
+### Find user B in search (ручная проверка id)
+# @name searchB
+GET {{baseUrl}}/users/search?nickname={{nickname2}}&limit=20
+Authorization: Bearer {{tokenA}}
+
+@userBId = {{searchB.response.body.$.users[0].id}}
+
+### Find user A in search (ручная проверка id)
+# @name searchA
+GET {{baseUrl}}/users/search?nickname={{nickname1}}&limit=20
+Authorization: Bearer {{tokenA}}
+
+@userAId = {{searchA.response.body.$.users[0].id}}
+
+### Global send from A
+# @name globalSend
+POST {{baseUrl}}/chat/global/send
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "body": "global hello from A"
+}
+
+@global_message_id = {{globalSend.response.body.$.data.id}}
+
+### Global history
+GET {{baseUrl}}/chat/global/history?limit=50
+Authorization: Bearer {{tokenA}}
+
+### DM start A -> B (подставь реальный id B)
+# @name dmStart
+POST {{baseUrl}}/chat/dm/start
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "contact_user_id": {{userBId}}
+}
+
+@conversation_id = {{dmStart.response.body.$.conversation_id}}
+
+### DM send from A
+# @name dmSend1
+POST {{baseUrl}}/chat/dm/{{conversation_id}}/send
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "body": "dm hello from A"
+}
+
+@dm_message_id = {{dmSend1.response.body.$.data.id}}
+
+### DM history as B
+GET {{baseUrl}}/chat/dm/{{conversation_id}}/history?limit=50
+Authorization: Bearer {{tokenB}}
+
+### DM mute (B mutes A)
+POST {{baseUrl}}/chat/dm/{{conversation_id}}/mute
+Authorization: Bearer {{tokenB}}
+Content-Type: application/json
+
+{
+  "muted": true
+}
+
+### DM mute status (B)
+GET {{baseUrl}}/chat/dm/{{conversation_id}}/mute
+Authorization: Bearer {{tokenB}}
+
+### Notifications settings get (proxy -> notification-service)
+GET {{baseUrl}}/settings/notifications
+Authorization: Bearer {{tokenA}}
+
+### Notifications settings set (proxy -> notification-service)
+POST {{baseUrl}}/settings/notifications
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "allow_dm": true,
+  "allow_mentions": true,
+  "allow_reactions": true
+}
+
+### Push register token (proxy -> notification-service)
+POST {{baseUrl}}/push/register
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "token": "fake-fcm-token-for-test-a"
+}
+
+### Notifications summary
+GET {{baseUrl}}/notifications/summary
+Authorization: Bearer {{tokenA}}
+
+### Stickers my/default list
+GET {{baseUrl}}/stickers/my
+Authorization: Bearer {{tokenA}}
+
+### Admin stickers packs list
+GET {{baseUrl}}/admin/stickers/packs
+x-admin-key: {{adminKey}}
+
+### Admin create stickers pack
+# @name createPack
+POST {{baseUrl}}/admin/stickers/packs
+x-admin-key: {{adminKey}}
+Content-Type: application/json
+
+{
+  "code": "animals_pack",
+  "title": "Animals Pack",
+  "is_default": false,
+  "is_active": true
+}
+
+@pack_id = {{createPack.response.body.$.pack.id}}
+
+### Admin add sticker to pack
+# @name addSticker
+POST {{baseUrl}}/admin/stickers/packs/{{pack_id}}/stickers
+x-admin-key: {{adminKey}}
+Content-Type: application/json
+
+{
+  "sticker": "cat_happy_01",
+  "sort_order": 10,
+  "is_active": true
+}
+
+@sticker_id = {{addSticker.response.body.$.sticker.id}}
+
+### Admin grant pack to user A
+POST {{baseUrl}}/admin/stickers/packs/{{pack_id}}/grant-user
+x-admin-key: {{adminKey}}
+Content-Type: application/json
+
+{
+  "user_id": {{userAId}}
+}
+
+### Stickers available for user A
+GET {{baseUrl}}/stickers/available
+Authorization: Bearer {{tokenA}}
+
+### DM send by A with allowed sticker token
+POST {{baseUrl}}/chat/dm/{{conversation_id}}/send
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "body": "A sends sticker [cat_happy_01#{{sticker_id}}]"
+}
+
+### DM send by B with forbidden sticker token only (ожидается 400: body required после фильтра)
+POST {{baseUrl}}/chat/dm/{{conversation_id}}/send
+Authorization: Bearer {{tokenB}}
+Content-Type: application/json
+
+{
+  "body": "[cat_happy_01#{{sticker_id}}]"
+}
+
+### DM send mixed text + sticker (ожидается 400: mixing запрещен)
+POST {{baseUrl}}/chat/dm/{{conversation_id}}/send
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "body": "hello [cat_happy_01#{{sticker_id}}] world"
+}
+
+### DM send plain text as separate message
+POST {{baseUrl}}/chat/dm/{{conversation_id}}/send
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "body": "hello world"
+}
+
+### DM send sticker as separate message
+POST {{baseUrl}}/chat/dm/{{conversation_id}}/send
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "body": "[cat_happy_01#{{sticker_id}}]"
+}
+
+### DM send two stickers in one message (ожидается 400: only one sticker token allowed)
+POST {{baseUrl}}/chat/dm/{{conversation_id}}/send
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "body": "[cat_happy_01#{{sticker_id}}][cat_happy_01#{{sticker_id}}]"
+}
+
+### DM send sticker again as separate message (валидно)
+POST {{baseUrl}}/chat/dm/{{conversation_id}}/send
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "body": "[cat_happy_01#{{sticker_id}}]"
+}
+
+### DM history
+GET {{baseUrl}}/chat/dm/{{conversation_id}}/history?limit=50
+Authorization: Bearer {{tokenA}}

@@ -11,13 +11,18 @@ const crypto = require('crypto');
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
+function normalizeSecret(v) {
+  const s = String(v || '');
+  return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
+}
+
 // --- CONFIGURATION FROM ENV ---
-const ACCESS_SECRET = process.env.ACCESS_SECRET;
-const REFRESH_SECRET = process.env.REFRESH_SECRET;
+const ACCESS_SECRET = normalizeSecret(process.env.ACCESS_SECRET);
+const REFRESH_SECRET = normalizeSecret(process.env.REFRESH_SECRET);
 const PORT = process.env.PORT || 3000;
 
 // optional admin key (для сидов/добавления новых названий аватарок, если захочешь)
-const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY || '';
+const ADMIN_SECRET_KEY = normalizeSecret(process.env.ADMIN_SECRET_KEY);
 
 if (!ACCESS_SECRET || !REFRESH_SECRET || !process.env.DATABASE_URL) {
   console.error('❌ Missing required env vars: ACCESS_SECRET, REFRESH_SECRET, DATABASE_URL');

@@ -93,6 +93,74 @@ function normalizeStickerString(v) {
   return String(v ?? "").trim();
 }
 
+// inline sticker in message body: [sticker_name#123]
+const STICKER_INLINE_RE = /\[([\p{L}\p{N}_\-.]{1,64})#(\d{1,10})\]/gu;
+
+function analyzeInlineStickerLayout(text) {
+  const body = String(text || "");
+  const matches = Array.from(body.matchAll(STICKER_INLINE_RE));
+  if (!matches.length) return { hasSticker: false, mixed: false, total: 0 };
+
+  const noTokens = body.replace(STICKER_INLINE_RE, "").trim();
+  return {
+    hasSticker: true,
+    mixed: noTokens.length > 0,
+    total: matches.length,
+  };
+}
+
+async function getAllowedInlineStickerKeys(userId) {
+  const r = await pool.query(
+    `
+      SELECT s.id, s.value
+      FROM sticker_packs p
+      JOIN sticker_pack_items s
+        ON s.pack_id = p.id
+       AND s.is_active = true
+      WHERE p.is_active = true
+        AND (
+          p.is_default = true
+          OR EXISTS (
+            SELECT 1
+            FROM user_sticker_packs usp
+            WHERE usp.user_id = $1
+              AND usp.pack_id = p.id
+          )
+        )
+    `,
+    [userId]
+  );
+
+  const out = new Set();
+  for (const row of r.rows) {
+    const sid = Number(row.id);
+    const sval = String(row.value || "");
+    if (!Number.isInteger(sid) || sid <= 0 || !sval) continue;
+    out.add(`${sval}#${sid}`);
+  }
+  return out;
+}
+
+async function sanitizeInlineStickersForUser(userId, text) {
+  const body = String(text || "");
+  const matches = Array.from(body.matchAll(STICKER_INLINE_RE));
+  if (!matches.length) return { body, removed: 0, total: 0 };
+
+  const allowed = await getAllowedInlineStickerKeys(userId);
+  let removed = 0;
+
+  const cleaned = body.replace(STICKER_INLINE_RE, (full, stickerName, stickerIdRaw) => {
+    const stickerId = Number(stickerIdRaw);
+    const key = `${String(stickerName)}#${stickerId}`;
+    if (Number.isInteger(stickerId) && stickerId > 0 && allowed.has(key)) return full;
+    removed++;
+    return "";
+  });
+
+  const normalized = removed > 0 ? cleaned.replace(/[ \t]{2,}/g, " ").trim() : cleaned;
+  return { body: normalized, removed, total: matches.length };
+}
+
 const requireAdmin = (req, res, next) => {
   const key = req.headers["x-admin-key"];
   if (!ADMIN_SECRET_KEY) return res.status(500).json({ error: "ADMIN_SECRET_KEY not configured" });
@@ -951,7 +1019,24 @@ app.get("/chat/global/history", authenticateToken, async (req, res) => {
 app.post("/chat/global/send", authenticateToken, async (req, res) => {
   await touchPresence(req.user.uid);
 
-  const body = (req.body?.body || "").toString();
+  const rawBody = (req.body?.body || "").toString();
+  const stickerLayout = analyzeInlineStickerLayout(rawBody);
+  if (stickerLayout.mixed) {
+    return res.status(400).json({ error: "Do not mix sticker tokens with plain text in one message" });
+  }
+  if (stickerLayout.total > 1) {
+    return res.status(400).json({ error: "Only one sticker token is allowed per message" });
+  }
+  const stickerFilter = await sanitizeInlineStickersForUser(req.user.uid, rawBody);
+  const body = stickerFilter.body;
+  if (stickerFilter.removed > 0) {
+    log("debug", "stickers.inline.filtered", {
+      uid: req.user.uid,
+      route: "global.send",
+      removed: stickerFilter.removed,
+      total: stickerFilter.total,
+    });
+  }
   const replyToRaw = req.body?.reply_to_id;
   const reply_to_id = replyToRaw === null || replyToRaw === undefined || replyToRaw === "" ? null : Number(replyToRaw);
 
@@ -1300,7 +1385,24 @@ app.post("/chat/dm/:conversation_id/send", authenticateToken, async (req, res) =
   await touchPresence(req.user.uid);
 
   const conversationId = req.params.conversation_id;
-  const body = (req.body?.body || "").toString();
+  const rawBody = (req.body?.body || "").toString();
+  const stickerLayout = analyzeInlineStickerLayout(rawBody);
+  if (stickerLayout.mixed) {
+    return res.status(400).json({ error: "Do not mix sticker tokens with plain text in one message" });
+  }
+  if (stickerLayout.total > 1) {
+    return res.status(400).json({ error: "Only one sticker token is allowed per message" });
+  }
+  const stickerFilter = await sanitizeInlineStickersForUser(req.user.uid, rawBody);
+  const body = stickerFilter.body;
+  if (stickerFilter.removed > 0) {
+    log("debug", "stickers.inline.filtered", {
+      uid: req.user.uid,
+      route: "dm.send",
+      removed: stickerFilter.removed,
+      total: stickerFilter.total,
+    });
+  }
 
   const replyToRaw = req.body?.reply_to_id;
   const reply_to_id = replyToRaw === null || replyToRaw === undefined || replyToRaw === "" ? null : Number(replyToRaw);

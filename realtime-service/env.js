@@ -11,7 +11,9 @@ function readEnv(name, opts = {}) {
     return "";
   }
 
-  const s = String(v);
+  let s = String(v);
+  // Support secrets saved as UTF-8 with BOM.
+  if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
 
   if (required && !allowEmpty && s.trim() === "") {
     throw new Error(`Empty env var: ${name}`);

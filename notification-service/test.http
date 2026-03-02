@@ -1,0 +1,157 @@
+@baseUrl = http://localhost:3002
+@authUrl = http://localhost:3000
+@adminKey = put-your-admin-key-here
+
+@login1 = test_user_a
+@password1 = 1234
+@login2 = test_user_b
+@password2 = 1234
+@conversationId = put-dm-conversation-id-here
+@fromUserId = 1
+@toUserId = 2
+
+### Ping
+GET {{baseUrl}}/ping
+
+### Login A
+# @name loginA
+POST {{authUrl}}/login
+Content-Type: application/json
+
+{
+  "login": "{{login1}}",
+  "password": "{{password1}}"
+}
+
+@tokenA = {{loginA.response.body.$.access_token}}
+
+### Login B
+# @name loginB
+POST {{authUrl}}/login
+Content-Type: application/json
+
+{
+  "login": "{{login2}}",
+  "password": "{{password2}}"
+}
+
+@tokenB = {{loginB.response.body.$.access_token}}
+
+### Settings get (A)
+GET {{baseUrl}}/settings/notifications
+Authorization: Bearer {{tokenA}}
+
+### Settings set (A)
+POST {{baseUrl}}/settings/notifications
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "allow_dm": true,
+  "allow_mentions": true,
+  "allow_reactions": true
+}
+
+### Prefs get (A)
+GET {{baseUrl}}/prefs/notifications
+Authorization: Bearer {{tokenA}}
+
+### Prefs set (A)
+POST {{baseUrl}}/prefs/notifications
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "dm_enabled": true,
+  "mentions_enabled": true,
+  "global_reactions_enabled": true
+}
+
+### Register fake push token (A)
+POST {{baseUrl}}/push/register
+Authorization: Bearer {{tokenA}}
+Content-Type: application/json
+
+{
+  "token": "fake-fcm-token-a"
+}
+
+### Register fake push token (B)
+POST {{baseUrl}}/push/register
+Authorization: Bearer {{tokenB}}
+Content-Type: application/json
+
+{
+  "token": "fake-fcm-token-b"
+}
+
+### DM mute set (B mutes A) - requires existing conversation id
+POST {{baseUrl}}/chat/dm/{{conversationId}}/mute
+Authorization: Bearer {{tokenB}}
+Content-Type: application/json
+
+{
+  "muted": true
+}
+
+### DM mute get (B)
+GET {{baseUrl}}/chat/dm/{{conversationId}}/mute
+Authorization: Bearer {{tokenB}}
+
+### Summary (A)
+GET {{baseUrl}}/notifications/summary
+Authorization: Bearer {{tokenA}}
+
+### Internal push dm (admin)
+POST {{baseUrl}}/internal/push/send
+x-admin-key: {{adminKey}}
+Content-Type: application/json
+
+{
+  "kind": "dm",
+  "to_user_id": {{toUserId}},
+  "from_user_id": {{fromUserId}},
+  "type": "dm",
+  "title": "DM test",
+  "body": "body from .http",
+  "data": {
+    "context": "dm",
+    "conversation_id": "{{conversationId}}"
+  }
+}
+
+### Internal push mention (admin)
+POST {{baseUrl}}/internal/push/send
+x-admin-key: {{adminKey}}
+Content-Type: application/json
+
+{
+  "kind": "mention",
+  "to_user_id": {{toUserId}},
+  "type": "mention",
+  "title": "Mention test",
+  "body": "mention body",
+  "data": {
+    "context": "global",
+    "message_id": "1"
+  }
+}
+
+### Internal push reaction (admin)
+POST {{baseUrl}}/internal/push/send
+x-admin-key: {{adminKey}}
+Content-Type: application/json
+
+{
+  "kind": "reaction",
+  "to_user_id": {{toUserId}},
+  "from_user_id": {{fromUserId}},
+  "type": "reaction",
+  "title": "Reaction test",
+  "body": "reaction body",
+  "data": {
+    "context": "dm",
+    "message_id": "1",
+    "reaction": "1"
+  }
+}
