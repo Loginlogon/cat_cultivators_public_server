@@ -4,6 +4,8 @@ const express = require("express");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
 const { v4: uuidv4 } = require("uuid");
+const http = require("http");
+const https = require("https");
 const { readEnv } = require("./env");
 
 // -------------------- CONFIG --------------------
@@ -239,6 +241,77 @@ async function proxyToRealtime(req, res) {
   } catch (e) {
     log("error", "proxy.realtime.failed", { err: e?.message || String(e), path: req.originalUrl });
     res.status(502).json({ error: "realtime-service unavailable" });
+  }
+}
+
+function proxyToRealtimeSse(req, res) {
+  try {
+    const target = new URL(REALTIME_URL + req.originalUrl);
+    const transport = target.protocol === "https:" ? https : http;
+
+    const headers = {};
+    if (req.headers.authorization) headers["authorization"] = req.headers.authorization;
+    if (req.headers["last-event-id"]) headers["last-event-id"] = req.headers["last-event-id"];
+    headers["accept"] = "text/event-stream";
+    headers["cache-control"] = "no-cache";
+    headers["connection"] = "keep-alive";
+
+    const upstreamReq = transport.request(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port || (target.protocol === "https:" ? 443 : 80),
+        method: "GET",
+        path: `${target.pathname}${target.search}`,
+        headers,
+      },
+      (upstreamRes) => {
+        res.status(upstreamRes.statusCode || 502);
+
+        const passHeaders = [
+          "content-type",
+          "cache-control",
+          "connection",
+          "x-accel-buffering",
+          "transfer-encoding",
+        ];
+        for (const h of passHeaders) {
+          const v = upstreamRes.headers[h];
+          if (v !== undefined) res.setHeader(h, v);
+        }
+
+        res.flushHeaders?.();
+
+        upstreamRes.on("data", (chunk) => {
+          if (!res.writableEnded) res.write(chunk);
+        });
+
+        upstreamRes.on("end", () => {
+          if (!res.writableEnded) res.end();
+        });
+
+        upstreamRes.on("error", (e) => {
+          log("error", "proxy.realtime.sse.stream_failed", { err: e?.message || String(e), path: req.originalUrl });
+          if (!res.writableEnded) res.end();
+        });
+      }
+    );
+
+    upstreamReq.on("error", (e) => {
+      log("error", "proxy.realtime.sse.failed", { err: e?.message || String(e), path: req.originalUrl });
+      if (!res.headersSent) return res.status(502).json({ error: "realtime-service unavailable" });
+      if (!res.writableEnded) res.end();
+    });
+
+    req.on("close", () => {
+      upstreamReq.destroy();
+    });
+
+    upstreamReq.end();
+  } catch (e) {
+    log("error", "proxy.realtime.sse.failed", { err: e?.message || String(e), path: req.originalUrl });
+    if (!res.headersSent) return res.status(502).json({ error: "realtime-service unavailable" });
+    if (!res.writableEnded) res.end();
   }
 }
 
@@ -590,7 +663,7 @@ async function initDbForever() {
 }
 
 // -------------------- REALTIME ROUTES (PROXY) --------------------
-app.get("/events", authenticateToken, proxyToRealtime);
+app.get("/events", authenticateToken, proxyToRealtimeSse);
 
 // -------------------- BASIC ROUTES --------------------
 app.get("/ping", (req, res) => {
