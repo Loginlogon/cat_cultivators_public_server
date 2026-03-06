@@ -330,6 +330,101 @@ function setupSubscriberHandlersOnce() {
     })();
   });
 
+  subscriber.notifications.on("global_reactions", (payload) => {
+    (async () => {
+      try {
+        const obj = safeJson(payload);
+        const msgId = Number(obj?.message_id);
+        if (!Number.isInteger(msgId) || msgId <= 0) return;
+
+        const counts = await pool.query(
+          `SELECT
+             COUNT(*) FILTER (WHERE reaction = 1)::int  AS like_count,
+             COUNT(*) FILTER (WHERE reaction = -1)::int AS dislike_count
+           FROM global_reactions
+           WHERE message_id = $1`,
+          [msgId]
+        );
+
+        const out = {
+          type: "global_reaction",
+          message_id: msgId,
+          actor_user_id: Number(obj?.user_id) || null,
+          reaction: Number(obj?.reaction) || 0,
+          prev_reaction: Number(obj?.prev_reaction) || 0,
+          like_count: counts.rows[0]?.like_count || 0,
+          dislike_count: counts.rows[0]?.dislike_count || 0,
+          updated_at: obj?.updated_at || new Date().toISOString(),
+          instance: INSTANCE,
+          source: "notify",
+        };
+
+        let sent = 0;
+        for (const [, set] of sseClients.entries()) {
+          for (const entry of set) {
+            if (entry.scope !== "global") continue;
+            try {
+              sseSend(entry.res, out, `global-reaction:${msgId}:${Date.now()}`);
+              sent++;
+            } catch (_) {}
+          }
+        }
+
+        log("info", "global.reaction.sse.sent", { msgId, source: "notify", sent });
+      } catch (e) {
+        log("error", "global.reaction.handler.failed", { err: e?.message || String(e) });
+      }
+    })();
+  });
+
+  subscriber.notifications.on("dm_reactions", (payload) => {
+    (async () => {
+      try {
+        const obj = safeJson(payload);
+        const msgId = Number(obj?.message_id);
+        const convId = obj?.conversation_id;
+        if (!Number.isInteger(msgId) || msgId <= 0 || !convId) return;
+
+        const pair = await pool.query(
+          "SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1",
+          [convId]
+        );
+        if (!pair.rows.length) return;
+
+        const counts = await pool.query(
+          `SELECT
+             COUNT(*) FILTER (WHERE reaction = 1)::int  AS like_count,
+             COUNT(*) FILTER (WHERE reaction = -1)::int AS dislike_count
+           FROM dm_reactions
+           WHERE message_id = $1`,
+          [msgId]
+        );
+
+        const { user_low, user_high } = pair.rows[0];
+        const out = {
+          type: "dm_reaction",
+          conversation_id: convId,
+          message_id: msgId,
+          actor_user_id: Number(obj?.user_id) || null,
+          reaction: Number(obj?.reaction) || 0,
+          prev_reaction: Number(obj?.prev_reaction) || 0,
+          like_count: counts.rows[0]?.like_count || 0,
+          dislike_count: counts.rows[0]?.dislike_count || 0,
+          updated_at: obj?.updated_at || new Date().toISOString(),
+          instance: INSTANCE,
+          source: "notify",
+        };
+
+        const toLow = broadcastToUser(user_low, out, (scope) => scope === "dm" || scope === `dm:${convId}`, `dm-reaction:${convId}:${msgId}:${Date.now()}`);
+        const toHigh = broadcastToUser(user_high, out, (scope) => scope === "dm" || scope === `dm:${convId}`, `dm-reaction:${convId}:${msgId}:${Date.now()}`);
+
+        log("info", "dm.reaction.sse.sent", { msgId, convId, source: "notify", toLow, toHigh });
+      } catch (e) {
+        log("error", "dm.reaction.handler.failed", { err: e?.message || String(e) });
+      }
+    })();
+  });
+
   subscriber.events.on("error", (err) => log("error", "pg-listen.error", { err: err?.message || String(err) }));
 }
 
@@ -341,6 +436,8 @@ async function startSubscriberForever() {
       await subscriber.connect();
       await subscriber.listenTo("global_messages");
       await subscriber.listenTo("dm_messages");
+      await subscriber.listenTo("global_reactions");
+      await subscriber.listenTo("dm_reactions");
       log("info", "subscriber.ready");
       return;
     } catch (e) {

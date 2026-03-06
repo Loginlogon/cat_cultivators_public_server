@@ -435,6 +435,75 @@ async function ensureNotifyTriggers(client) {
     $$ LANGUAGE plpgsql;
   `);
 
+  await client.query(`
+    CREATE OR REPLACE FUNCTION notify_global_reaction() RETURNS trigger AS $$
+    DECLARE
+      msg_id BIGINT;
+      actor_id INTEGER;
+      new_reaction SMALLINT;
+      old_reaction SMALLINT;
+      changed_at TIMESTAMP;
+    BEGIN
+      msg_id := COALESCE(NEW.message_id, OLD.message_id);
+      actor_id := COALESCE(NEW.user_id, OLD.user_id);
+      new_reaction := COALESCE(NEW.reaction, 0);
+      old_reaction := COALESCE(OLD.reaction, 0);
+      changed_at := COALESCE(NEW.updated_at, OLD.updated_at, CURRENT_TIMESTAMP);
+
+      PERFORM pg_notify(
+        'global_reactions',
+        json_build_object(
+          'message_id', msg_id,
+          'user_id', actor_id,
+          'reaction', new_reaction,
+          'prev_reaction', old_reaction,
+          'updated_at', changed_at,
+          'op', TG_OP
+        )::text
+      );
+      RETURN COALESCE(NEW, OLD);
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
+
+  await client.query(`
+    CREATE OR REPLACE FUNCTION notify_dm_reaction() RETURNS trigger AS $$
+    DECLARE
+      msg_id BIGINT;
+      actor_id INTEGER;
+      new_reaction SMALLINT;
+      old_reaction SMALLINT;
+      changed_at TIMESTAMP;
+      conv_id UUID;
+    BEGIN
+      msg_id := COALESCE(NEW.message_id, OLD.message_id);
+      actor_id := COALESCE(NEW.user_id, OLD.user_id);
+      new_reaction := COALESCE(NEW.reaction, 0);
+      old_reaction := COALESCE(OLD.reaction, 0);
+      changed_at := COALESCE(NEW.updated_at, OLD.updated_at, CURRENT_TIMESTAMP);
+
+      SELECT conversation_id INTO conv_id
+      FROM dm_messages
+      WHERE id = msg_id
+      LIMIT 1;
+
+      PERFORM pg_notify(
+        'dm_reactions',
+        json_build_object(
+          'conversation_id', conv_id,
+          'message_id', msg_id,
+          'user_id', actor_id,
+          'reaction', new_reaction,
+          'prev_reaction', old_reaction,
+          'updated_at', changed_at,
+          'op', TG_OP
+        )::text
+      );
+      RETURN COALESCE(NEW, OLD);
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
+
   await client.query(`DROP TRIGGER IF EXISTS trg_notify_global_message ON global_messages;`);
   await client.query(`
     CREATE TRIGGER trg_notify_global_message
@@ -447,6 +516,20 @@ async function ensureNotifyTriggers(client) {
     CREATE TRIGGER trg_notify_dm_message
     AFTER INSERT ON dm_messages
     FOR EACH ROW EXECUTE FUNCTION notify_dm_message();
+  `);
+
+  await client.query(`DROP TRIGGER IF EXISTS trg_notify_global_reaction ON global_reactions;`);
+  await client.query(`
+    CREATE TRIGGER trg_notify_global_reaction
+    AFTER INSERT OR UPDATE OR DELETE ON global_reactions
+    FOR EACH ROW EXECUTE FUNCTION notify_global_reaction();
+  `);
+
+  await client.query(`DROP TRIGGER IF EXISTS trg_notify_dm_reaction ON dm_reactions;`);
+  await client.query(`
+    CREATE TRIGGER trg_notify_dm_reaction
+    AFTER INSERT OR UPDATE OR DELETE ON dm_reactions
+    FOR EACH ROW EXECUTE FUNCTION notify_dm_reaction();
   `);
 
   log("info", "db.triggers.ready");
