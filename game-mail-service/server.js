@@ -303,7 +303,7 @@ function proxyToRealtimeSse(req, res) {
       if (!res.writableEnded) res.end();
     });
 
-    req.on("close", () => {
+    res.on("close", () => {
       upstreamReq.destroy();
     });
 
