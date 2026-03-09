@@ -333,9 +333,19 @@ function setupSubscriberHandlersOnce() {
   subscriber.notifications.on("global_reactions", (payload) => {
     (async () => {
       try {
+        log("info", "global.reaction.notify.received", { payload });
         const obj = safeJson(payload);
         const msgId = Number(obj?.message_id);
-        if (!Number.isInteger(msgId) || msgId <= 0) return;
+        log("info", "global.reaction.notify.parsed", {
+          message_id: obj?.message_id,
+          actor_user_id: obj?.user_id,
+          reaction: obj?.reaction,
+          prev_reaction: obj?.prev_reaction,
+        });
+        if (!Number.isInteger(msgId) || msgId <= 0) {
+          log("warn", "global.reaction.notify.ignored", { reason: "bad_message_id", payload });
+          return;
+        }
 
         const counts = await pool.query(
           `SELECT
@@ -345,6 +355,12 @@ function setupSubscriberHandlersOnce() {
            WHERE message_id = $1`,
           [msgId]
         );
+        log("info", "global.reaction.notify.counts", {
+          msgId,
+          like_count: counts.rows[0]?.like_count || 0,
+          dislike_count: counts.rows[0]?.dislike_count || 0,
+          connected_users: sseClients.size,
+        });
 
         const out = {
           type: "global_reaction",
@@ -370,7 +386,7 @@ function setupSubscriberHandlersOnce() {
           }
         }
 
-        log("info", "global.reaction.sse.sent", { msgId, source: "notify", sent });
+        log("info", "global.reaction.sse.sent", { msgId, source: "notify", sent, connected_users: sseClients.size });
       } catch (e) {
         log("error", "global.reaction.handler.failed", { err: e?.message || String(e) });
       }
@@ -380,16 +396,30 @@ function setupSubscriberHandlersOnce() {
   subscriber.notifications.on("dm_reactions", (payload) => {
     (async () => {
       try {
+        log("info", "dm.reaction.notify.received", { payload });
         const obj = safeJson(payload);
         const msgId = Number(obj?.message_id);
         const convId = obj?.conversation_id;
-        if (!Number.isInteger(msgId) || msgId <= 0 || !convId) return;
+        log("info", "dm.reaction.notify.parsed", {
+          conversation_id: convId,
+          message_id: obj?.message_id,
+          actor_user_id: obj?.user_id,
+          reaction: obj?.reaction,
+          prev_reaction: obj?.prev_reaction,
+        });
+        if (!Number.isInteger(msgId) || msgId <= 0 || !convId) {
+          log("warn", "dm.reaction.notify.ignored", { reason: "bad_payload", payload });
+          return;
+        }
 
         const pair = await pool.query(
           "SELECT user_low, user_high FROM dm_pairs WHERE conversation_id = $1 LIMIT 1",
           [convId]
         );
-        if (!pair.rows.length) return;
+        if (!pair.rows.length) {
+          log("warn", "dm.reaction.notify.no_pair", { convId, msgId });
+          return;
+        }
 
         const counts = await pool.query(
           `SELECT
@@ -401,6 +431,15 @@ function setupSubscriberHandlersOnce() {
         );
 
         const { user_low, user_high } = pair.rows[0];
+        log("info", "dm.reaction.notify.counts", {
+          convId,
+          msgId,
+          user_low,
+          user_high,
+          like_count: counts.rows[0]?.like_count || 0,
+          dislike_count: counts.rows[0]?.dislike_count || 0,
+          connected_users: sseClients.size,
+        });
         const out = {
           type: "dm_reaction",
           conversation_id: convId,
@@ -418,7 +457,7 @@ function setupSubscriberHandlersOnce() {
         const toLow = broadcastToUser(user_low, out, (scope) => scope === "dm" || scope === `dm:${convId}`, `dm-reaction:${convId}:${msgId}:${Date.now()}`);
         const toHigh = broadcastToUser(user_high, out, (scope) => scope === "dm" || scope === `dm:${convId}`, `dm-reaction:${convId}:${msgId}:${Date.now()}`);
 
-        log("info", "dm.reaction.sse.sent", { msgId, convId, source: "notify", toLow, toHigh });
+        log("info", "dm.reaction.sse.sent", { msgId, convId, source: "notify", toLow, toHigh, connected_users: sseClients.size });
       } catch (e) {
         log("error", "dm.reaction.handler.failed", { err: e?.message || String(e) });
       }

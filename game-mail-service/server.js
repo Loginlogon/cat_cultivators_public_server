@@ -1299,6 +1299,8 @@ app.post("/chat/global/:message_id/react", authenticateToken, async (req, res) =
   const messageId = Number(req.params.message_id);
   const reaction = Number(req.body?.reaction);
 
+  log("info", "global.react.request", { messageId, actor_user_id: req.user.uid, reaction });
+
   if (!Number.isInteger(messageId) || messageId <= 0) return res.status(400).json({ error: "bad message_id" });
   if (![-1, 0, 1].includes(reaction)) return res.status(400).json({ error: "reaction must be -1, 0 or 1" });
 
@@ -1319,9 +1321,11 @@ app.post("/chat/global/:message_id/react", authenticateToken, async (req, res) =
       [messageId, req.user.uid]
     );
     const prevReaction = Number(prev.rows[0]?.reaction || 0);
+    log("info", "global.react.previous", { messageId, actor_user_id: req.user.uid, prev_reaction: prevReaction });
 
     if (reaction === 0) {
       await pool.query(`DELETE FROM global_reactions WHERE message_id = $1 AND user_id = $2`, [messageId, req.user.uid]);
+      log("info", "global.react.write", { messageId, actor_user_id: req.user.uid, op: "DELETE" });
     } else {
       await pool.query(
         `INSERT INTO global_reactions (message_id, user_id, reaction, updated_at)
@@ -1330,7 +1334,23 @@ app.post("/chat/global/:message_id/react", authenticateToken, async (req, res) =
          DO UPDATE SET reaction = EXCLUDED.reaction, updated_at = CURRENT_TIMESTAMP`,
         [messageId, req.user.uid, reaction]
       );
+      log("info", "global.react.write", { messageId, actor_user_id: req.user.uid, op: "UPSERT", reaction });
     }
+
+    const counts = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE reaction = 1)::int  AS like_count,
+         COUNT(*) FILTER (WHERE reaction = -1)::int AS dislike_count
+       FROM global_reactions
+       WHERE message_id = $1`,
+      [messageId]
+    );
+    log("info", "global.react.counts", {
+      messageId,
+      actor_user_id: req.user.uid,
+      like_count: counts.rows[0]?.like_count || 0,
+      dislike_count: counts.rows[0]?.dislike_count || 0,
+    });
 
     // push на новую реакцию, если не себе (в notification-service)
     if (reaction !== 0 && reaction !== prevReaction && ownerId !== req.user.uid) {
@@ -1359,6 +1379,7 @@ app.post("/chat/global/:message_id/react", authenticateToken, async (req, res) =
       }
     }
 
+    log("info", "global.react.done", { messageId, actor_user_id: req.user.uid, ok: true });
     res.json({ ok: true });
   } catch (e) {
     log("error", "global.react.failed", { err: e?.message || String(e), messageId });
@@ -1685,6 +1706,8 @@ app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateTok
   const messageId = Number(req.params.message_id);
   const reaction = Number(req.body?.reaction);
 
+  log("info", "dm.react.request", { conversationId, messageId, actor_user_id: req.user.uid, reaction });
+
   if (!Number.isInteger(messageId) || messageId <= 0) return res.status(400).json({ error: "bad message_id" });
   if (![-1, 0, 1].includes(reaction)) return res.status(400).json({ error: "reaction must be -1, 0 or 1" });
 
@@ -1714,9 +1737,11 @@ app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateTok
       [messageId, req.user.uid]
     );
     const prevReaction = Number(prev.rows[0]?.reaction || 0);
+    log("info", "dm.react.previous", { conversationId, messageId, actor_user_id: req.user.uid, prev_reaction: prevReaction });
 
     if (reaction === 0) {
       await pool.query(`DELETE FROM dm_reactions WHERE message_id = $1 AND user_id = $2`, [messageId, req.user.uid]);
+      log("info", "dm.react.write", { conversationId, messageId, actor_user_id: req.user.uid, op: "DELETE" });
     } else {
       await pool.query(
         `INSERT INTO dm_reactions (message_id, user_id, reaction, updated_at)
@@ -1725,7 +1750,24 @@ app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateTok
          DO UPDATE SET reaction = EXCLUDED.reaction, updated_at = EXCLUDED.updated_at`,
         [messageId, req.user.uid, reaction]
       );
+      log("info", "dm.react.write", { conversationId, messageId, actor_user_id: req.user.uid, op: "UPSERT", reaction });
     }
+
+    const counts = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE reaction = 1)::int  AS like_count,
+         COUNT(*) FILTER (WHERE reaction = -1)::int AS dislike_count
+       FROM dm_reactions
+       WHERE message_id = $1`,
+      [messageId]
+    );
+    log("info", "dm.react.counts", {
+      conversationId,
+      messageId,
+      actor_user_id: req.user.uid,
+      like_count: counts.rows[0]?.like_count || 0,
+      dislike_count: counts.rows[0]?.dislike_count || 0,
+    });
 
     if (reaction !== 0 && reaction !== prevReaction && ownerId !== req.user.uid) {
       const me = await getUserBasic(req.user.uid);
@@ -1754,6 +1796,7 @@ app.post("/chat/dm/:conversation_id/messages/:message_id/react", authenticateTok
       }
     }
 
+    log("info", "dm.react.done", { conversationId, messageId, actor_user_id: req.user.uid, ok: true });
     res.json({ ok: true });
   } catch (e) {
     log("error", "dm.react.failed", { err: e?.message || String(e), conversationId, messageId });
