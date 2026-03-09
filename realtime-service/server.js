@@ -156,6 +156,7 @@ function sseComment(res, text) {
 }
 
 function safeJson(s) {
+  if (s && typeof s === "object") return s;
   try {
     return JSON.parse(s);
   } catch (_) {
