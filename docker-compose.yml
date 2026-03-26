@@ -50,12 +50,51 @@ services:
       - DB_NAME
     environment:
       REDIS_URL: redis://redis:6379
+      MAIL_SERVICE_URL: http://mail-service:3004
       PORT: 3000
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  game-service:
+    build: ./game-service
+    restart: always
+    ports:
+      - "3005:3005"
+    secrets:
+      - ADMIN_SECRET_KEY
+      - DB_USER
+      - DB_PASSWORD
+      - DB_NAME
+    environment:
+      LOG_LEVEL: debug
+      PORT: 3005
+    depends_on:
+      db:
+        condition: service_healthy
+
+  mail-service:
+    build: ./mail-service
+    restart: always
+    ports:
+      - "3004:3004"
+    secrets:
+      - ACCESS_SECRET
+      - ADMIN_SECRET_KEY
+      - DB_USER
+      - DB_PASSWORD
+      - DB_NAME
+    environment:
+      LOG_LEVEL: debug
+      PORT: 3004
+      GAME_SERVICE_URL: http://game-service:3005
+    depends_on:
+      db:
+        condition: service_healthy
+      game-service:
+        condition: service_started
 
   notification-service:
     build: ./notification-service
@@ -96,8 +135,8 @@ services:
       redis:
         condition: service_healthy
 
-  game-mail:
-    build: ./game-mail-service
+  chat-service:
+    build: ./chat-service
     restart: always
     ports:
       - "3001:3001"

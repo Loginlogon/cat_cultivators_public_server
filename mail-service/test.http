@@ -1,0 +1,69 @@
+@baseUrl = http://localhost:3004
+@authUrl = http://localhost:3000
+@adminKey = put-your-admin-key-here
+
+@login = test_user
+@password = 1234
+@mailId = put-mail-uuid-here
+
+### Ping
+GET {{baseUrl}}/ping
+
+### Login
+# @name loginReq
+POST {{authUrl}}/login
+Content-Type: application/json
+
+{
+  "login": "{{login}}",
+  "password": "{{password}}"
+}
+
+@accessToken = {{loginReq.response.body.$.access_token}}
+
+### Inbox
+GET {{baseUrl}}/mail/inbox
+Authorization: Bearer {{accessToken}}
+
+### Mail detail
+GET {{baseUrl}}/mail/{{mailId}}
+Authorization: Bearer {{accessToken}}
+
+### Mark read
+POST {{baseUrl}}/mail/{{mailId}}/read
+Authorization: Bearer {{accessToken}}
+
+### Claim reward
+POST {{baseUrl}}/mail/{{mailId}}/claim
+Authorization: Bearer {{accessToken}}
+
+### Admin send
+POST {{baseUrl}}/admin/mail/send
+Content-Type: application/json
+x-admin-key: {{adminKey}}
+
+{
+  "to_user_id": 1,
+  "subject": "Admin reward",
+  "body": "Manual smoke-check mail",
+  "reward_json": {
+    "money_mortals": 5,
+    "money_cultivators": 1
+  }
+}
+
+### Internal system send
+POST {{baseUrl}}/internal/mail/send
+Content-Type: application/json
+x-admin-key: {{adminKey}}
+
+{
+  "to_user_id": 1,
+  "from_type": "system",
+  "subject": "System reward",
+  "body": "Registration-style mail",
+  "reward_json": {
+    "money_mortals": 20,
+    "money_cultivators": 1
+  }
+}

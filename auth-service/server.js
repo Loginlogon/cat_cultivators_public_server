@@ -6,7 +6,6 @@ const bcrypt = require('bcrypt');
 const { Pool } = require('pg');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -20,6 +19,7 @@ function normalizeSecret(v) {
 const ACCESS_SECRET = normalizeSecret(process.env.ACCESS_SECRET);
 const REFRESH_SECRET = normalizeSecret(process.env.REFRESH_SECRET);
 const PORT = process.env.PORT || 3000;
+const MAIL_SERVICE_URL = String(process.env.MAIL_SERVICE_URL || 'http://mail-service:3004').replace(/\/+$/, '');
 
 // optional admin key (для сидов/добавления новых названий аватарок, если захочешь)
 const ADMIN_SECRET_KEY = normalizeSecret(process.env.ADMIN_SECRET_KEY);
@@ -96,21 +96,25 @@ const initDb = async () => {
     `);
 
     // ✅ ВАЖНО: таблица mails
+
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS mails (
-        id UUID PRIMARY KEY,
-        to_user_id INTEGER NOT NULL,
-        from_type TEXT NOT NULL CHECK (from_type IN ('system','admin','player')),
-        from_user_id INTEGER,
+      CREATE TABLE IF NOT EXISTS pending_registration_mails (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        nickname TEXT NOT NULL,
         subject TEXT NOT NULL,
         body TEXT NOT NULL,
-        reward_json JSONB,
-        status TEXT NOT NULL DEFAULT 'unread' CHECK (status IN ('unread','read','claimed')),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        reward_json JSONB NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        next_attempt_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_mails_to_created_desc ON mails(to_user_id, created_at DESC);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_mails_to_status_created_desc ON mails(to_user_id, status, created_at DESC);`);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_pending_registration_mails_retry
+      ON pending_registration_mails(next_attempt_at, created_at);
+    `);
 
     console.log('✅ Database tables initialized');
   } catch (err) {
@@ -215,6 +219,108 @@ function makeInheritanceMail(nickname) {
 
   const reward = { money_mortals: 20, money_cultivators: 1 };
   return { subject, body, reward };
+}
+
+async function markRegistrationMailRetry(client, userId, errorText, delayMinutes = 5) {
+  await client.query(
+    `UPDATE pending_registration_mails
+     SET attempts = attempts + 1,
+         last_error = $2,
+         next_attempt_at = CURRENT_TIMESTAMP + ($3::text || ' minutes')::interval,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE user_id = $1`,
+    [userId, String(errorText || 'unknown error').slice(0, 2000), String(delayMinutes)]
+  );
+}
+
+async function flushPendingRegistrationMail(userId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const pending = await client.query(
+      `SELECT user_id, subject, body, reward_json
+       FROM pending_registration_mails
+       WHERE user_id = $1
+       FOR UPDATE`,
+      [userId]
+    );
+
+    if (!pending.rows.length) {
+      await client.query('COMMIT');
+      return { ok: true, pending: false, delivered: false };
+    }
+
+    const row = pending.rows[0];
+
+    try {
+      const response = await fetch(`${MAIL_SERVICE_URL}/internal/mail/send`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          'x-admin-key': ADMIN_SECRET_KEY,
+        },
+        body: JSON.stringify({
+          to_user_id: row.user_id,
+          from_type: 'system',
+          subject: row.subject,
+          body: row.body,
+          reward_json: row.reward_json,
+        }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`mail-service returned ${response.status}: ${text}`.trim());
+      }
+
+      await client.query(`DELETE FROM pending_registration_mails WHERE user_id = $1`, [userId]);
+      await client.query('COMMIT');
+      return { ok: true, pending: false, delivered: true };
+    } catch (err) {
+      await markRegistrationMailRetry(client, userId, err?.message || err);
+      await client.query('COMMIT');
+      return { ok: false, pending: true, delivered: false, error: err?.message || String(err) };
+    }
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function flushPendingRegistrationMailsBatch(limit = 100) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const due = await client.query(
+      `SELECT user_id
+       FROM pending_registration_mails
+       WHERE next_attempt_at <= CURRENT_TIMESTAMP
+       ORDER BY created_at ASC
+       LIMIT $1
+       FOR UPDATE SKIP LOCKED`,
+      [limit]
+    );
+    await client.query('COMMIT');
+
+    let delivered = 0;
+    let failed = 0;
+
+    for (const row of due.rows) {
+      const result = await flushPendingRegistrationMail(row.user_id);
+      if (result.delivered) delivered++;
+      else failed++;
+    }
+
+    return { scanned: due.rows.length, delivered, failed };
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // --- ROUTES ---
@@ -330,17 +436,19 @@ app.post('/register', async (req, res) => {
       [userId, nick, 'default', 0, 0]
     );
 
-    const mailId = crypto.randomUUID();
     const mail = makeInheritanceMail(nick);
-
     await client.query(
-      `INSERT INTO mails (id, to_user_id, from_type, from_user_id, subject, body, reward_json, status)
-       VALUES ($1, $2, 'system', NULL, $3, $4, $5::jsonb, 'unread')`,
-      [mailId, userId, mail.subject, mail.body, JSON.stringify(mail.reward)]
+      `INSERT INTO pending_registration_mails (user_id, nickname, subject, body, reward_json)
+       VALUES ($1, $2, $3, $4, $5::jsonb)`,
+      [userId, nick, mail.subject, mail.body, JSON.stringify(mail.reward)]
     );
 
     await client.query('COMMIT');
-    return res.status(201).json({ message: 'Success' });
+    const mailDelivery = await flushPendingRegistrationMail(userId);
+    return res.status(201).json({
+      message: 'Success',
+      registration_mail: mailDelivery.delivered ? 'sent' : 'queued'
+    });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) {}
 
@@ -351,6 +459,18 @@ app.post('/register', async (req, res) => {
     return res.status(400).json({ error: 'Registration failed' });
   } finally {
     client.release();
+  }
+});
+
+app.post('/internal/maintenance/registration-mails/retry', requireAdmin, async (req, res) => {
+  const rawLimit = Number(req.body?.limit);
+  const limit = Number.isInteger(rawLimit) ? Math.max(1, Math.min(500, rawLimit)) : 100;
+
+  try {
+    const result = await flushPendingRegistrationMailsBatch(limit);
+    return res.json({ ok: true, ...result });
+  } catch (_) {
+    return res.status(500).json({ error: 'Retry failed' });
   }
 });
 
@@ -498,8 +618,10 @@ app.get('/avatars/my', authenticateToken, async (req, res) => {
 
 // 3) add avatar (unlock) — игроку добавить аватарку по строке
 // body: { "avatar": "default_avatar_1" }
-app.post('/avatars/add', authenticateToken, async (req, res) => {
+app.post('/avatars/add', requireAdmin, async (req, res) => {
+  const targetUserId = Number(req.body?.user_id);
   const code = (req.body?.avatar || '').toString().trim();
+  if (!Number.isInteger(targetUserId) || targetUserId <= 0) return res.status(400).json({ error: 'user_id required' });
   if (!code) return res.status(400).json({ error: 'avatar required' });
 
   const client = await pool.connect();
@@ -518,11 +640,11 @@ app.post('/avatars/add', authenticateToken, async (req, res) => {
       `INSERT INTO user_avatars (user_id, avatar_code)
        VALUES ($1, $2)
        ON CONFLICT (user_id, avatar_code) DO NOTHING`,
-      [req.user.uid, code]
+      [targetUserId, code]
     );
 
     await client.query('COMMIT');
-    res.json({ ok: true, avatar: code });
+    res.json({ ok: true, user_id: targetUserId, avatar: code });
   } catch (e) {
     try { await client.query('ROLLBACK'); } catch (_) {}
     res.status(500).json({ error: 'Database error' });

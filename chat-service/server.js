@@ -25,6 +25,7 @@ try {
 }
 
 const INSTANCE = process.env.INSTANCE_ID || require("os").hostname();
+const GLOBAL_CHAT_RETENTION_LIMIT = Math.max(100, Number(process.env.GLOBAL_CHAT_RETENTION_LIMIT || 5000));
 
 // куда проксировать уведомления
 const NOTIFICATION_URL = (process.env.NOTIFICATION_URL || "http://notification-service:3002").replace(/\/+$/, "");
@@ -185,6 +186,36 @@ const authenticateToken = (req, res, next) => {
 async function getUserBasic(userId) {
   const r = await pool.query("SELECT id, login, nickname FROM users WHERE id = $1 LIMIT 1", [userId]);
   return r.rows[0] || null;
+}
+
+async function runGlobalChatRetention(limit = GLOBAL_CHAT_RETENTION_LIMIT) {
+  const safeLimit = Math.max(100, Math.trunc(Number(limit) || GLOBAL_CHAT_RETENTION_LIMIT));
+
+  const deletedMessages = await pool.query(
+    `WITH doomed AS (
+       SELECT id
+       FROM global_messages
+       ORDER BY id DESC
+       OFFSET $1
+     )
+     DELETE FROM global_messages m
+     USING doomed d
+     WHERE m.id = d.id
+     RETURNING m.id`,
+    [safeLimit]
+  );
+
+  const deletedReactions = await pool.query(
+    `DELETE FROM global_reactions r
+     WHERE NOT EXISTS (SELECT 1 FROM global_messages m WHERE m.id = r.message_id)
+     RETURNING r.message_id`
+  );
+
+  return {
+    kept_limit: safeLimit,
+    deleted_messages: deletedMessages.rowCount || 0,
+    deleted_reactions: deletedReactions.rowCount || 0,
+  };
 }
 
 // -------------------- PROXY TO NOTIFICATION-SERVICE --------------------
@@ -611,22 +642,6 @@ async function initDbForever() {
       await client.query(`CREATE INDEX IF NOT EXISTS idx_dm_contacts_owner_unread ON dm_contacts(owner_user_id, last_message_id, last_read_message_id);`);
 
       await client.query(`
-        CREATE TABLE IF NOT EXISTS mails (
-          id UUID PRIMARY KEY,
-          to_user_id INTEGER NOT NULL,
-          from_type TEXT NOT NULL CHECK (from_type IN ('system','admin','player')),
-          from_user_id INTEGER,
-          subject TEXT NOT NULL,
-          body TEXT NOT NULL,
-          reward_json JSONB,
-          status TEXT NOT NULL DEFAULT 'unread' CHECK (status IN ('unread','read','claimed')),
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-      `);
-      await client.query(`CREATE INDEX IF NOT EXISTS idx_mails_to_created_desc ON mails(to_user_id, created_at DESC);`);
-      await client.query(`CREATE INDEX IF NOT EXISTS idx_mails_to_status_created_desc ON mails(to_user_id, status, created_at DESC);`);
-
-      await client.query(`
         CREATE TABLE IF NOT EXISTS global_reads (
           user_id INTEGER PRIMARY KEY,
           last_read_id BIGINT NOT NULL DEFAULT 0,
@@ -750,7 +765,20 @@ app.get("/events", authenticateToken, proxyToRealtimeSse);
 
 // -------------------- BASIC ROUTES --------------------
 app.get("/ping", (req, res) => {
-  res.json({ status: "ok", message: "pong", service: "game-mail-service", server_time: new Date().toISOString() });
+  res.json({ status: "ok", message: "pong", service: "chat-service", server_time: new Date().toISOString() });
+});
+
+app.post("/internal/maintenance/global-chat-retention", requireAdmin, async (req, res) => {
+  const rawLimit = Number(req.body?.keep_last ?? req.body?.limit ?? GLOBAL_CHAT_RETENTION_LIMIT);
+  const limit = Number.isInteger(rawLimit) ? rawLimit : GLOBAL_CHAT_RETENTION_LIMIT;
+
+  try {
+    const result = await runGlobalChatRetention(limit);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    log("error", "global.retention.failed", { err: e?.message || String(e), limit });
+    res.status(500).json({ error: "global retention failed" });
+  }
 });
 
 // -------------------- NOTIFICATIONS ROUTES (PROXY) --------------------
@@ -1221,14 +1249,6 @@ app.post("/chat/global/send", authenticateToken, async (req, res) => {
     );
 
     // чистка до 100
-    await pool.query(`
-      DELETE FROM global_messages
-      WHERE id NOT IN (SELECT id FROM global_messages ORDER BY id DESC LIMIT 100)
-    `);
-    await pool.query(`
-      DELETE FROM global_reactions r
-      WHERE NOT EXISTS (SELECT 1 FROM global_messages m WHERE m.id = r.message_id)
-    `);
 
     const msgId = insert.rows[0].id;
     const createdAt = insert.rows[0].created_at;
@@ -1924,176 +1944,6 @@ app.post("/chat/dm/:conversation_id/read", authenticateToken, async (req, res) =
     res.json({ ok: true, conversation_id: conversationId, last_read_message_id });
   } catch (e) {
     log("error", "dm.read.failed", { err: e?.message || String(e), conversationId });
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-// -------------------- MAIL --------------------
-app.get("/mail/inbox", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-
-  const limit = clampInt(req.query.limit, 50, 1, 50);
-  const before = (req.query.before_at || "").toString().trim();
-
-  try {
-    const q = before
-      ? `SELECT id, from_type, from_user_id, subject, status, created_at
-         FROM mails
-         WHERE to_user_id = $1 AND created_at < $2
-         ORDER BY created_at DESC
-         LIMIT $3`
-      : `SELECT id, from_type, from_user_id, subject, status, created_at
-         FROM mails
-         WHERE to_user_id = $1
-         ORDER BY created_at DESC
-         LIMIT $2`;
-
-    const params = before ? [req.user.uid, before, limit] : [req.user.uid, limit];
-    const r = await pool.query(q, params);
-
-    const next_before_at = r.rows.length ? r.rows[r.rows.length - 1].created_at : null;
-    res.json({ limit, next_before_at, mails: r.rows });
-  } catch (e) {
-    log("error", "mail.inbox.failed", { err: e?.message || String(e) });
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-app.get("/mail/:id", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-
-  const id = req.params.id;
-  try {
-    const r = await pool.query(
-      `SELECT id, to_user_id, from_type, from_user_id, subject, body, reward_json, status, created_at
-       FROM mails
-       WHERE id = $1 AND to_user_id = $2
-       LIMIT 1`,
-      [id, req.user.uid]
-    );
-    if (r.rows.length === 0) return res.status(404).json({ error: "Mail not found" });
-
-    if (r.rows[0].status === "unread") {
-      await pool.query(
-        `UPDATE mails SET status = 'read' WHERE id = $1 AND to_user_id = $2 AND status = 'unread'`,
-        [id, req.user.uid]
-      );
-      r.rows[0].status = "read";
-    }
-
-    res.json({ mail: r.rows[0] });
-  } catch (e) {
-    log("error", "mail.get.failed", { err: e?.message || String(e) });
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-app.post("/mail/:id/read", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-
-  const id = req.params.id;
-
-  try {
-    const upd = await pool.query(
-      `UPDATE mails
-       SET status = 'read'
-       WHERE id = $1 AND to_user_id = $2 AND status = 'unread'
-       RETURNING id, status`,
-      [id, req.user.uid]
-    );
-
-    if (upd.rows.length === 0) {
-      const chk = await pool.query(`SELECT id, status FROM mails WHERE id = $1 AND to_user_id = $2 LIMIT 1`, [id, req.user.uid]);
-      if (chk.rows.length === 0) return res.status(404).json({ error: "Mail not found" });
-      return res.json({ mail: chk.rows[0] });
-    }
-
-    res.json({ mail: upd.rows[0] });
-  } catch (e) {
-    log("error", "mail.read.failed", { err: e?.message || String(e) });
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-app.post("/mail/:id/claim", authenticateToken, async (req, res) => {
-  await touchPresence(req.user.uid);
-
-  const id = req.params.id;
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    const mailR = await client.query(
-      `SELECT id, reward_json, status
-       FROM mails
-       WHERE id = $1 AND to_user_id = $2
-       FOR UPDATE`,
-      [id, req.user.uid]
-    );
-
-    if (mailR.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Mail not found" });
-    }
-
-    const mail = mailR.rows[0];
-    if (mail.status === "claimed") {
-      await client.query("COMMIT");
-      return res.json({ status: "already_claimed" });
-    }
-
-    const reward = mail.reward_json || {};
-    const addMortals = Number.isFinite(Number(reward.money_mortals)) ? Number(reward.money_mortals) : 0;
-    const addCult = Number.isFinite(Number(reward.money_cultivators)) ? Number(reward.money_cultivators) : 0;
-
-    if (addMortals !== 0 || addCult !== 0) {
-      await client.query(
-        `UPDATE profiles
-         SET money_mortals = money_mortals + $1,
-             money_cultivators = money_cultivators + $2
-         WHERE user_id = $3`,
-        [addMortals, addCult, req.user.uid]
-      );
-    }
-
-    await client.query(`UPDATE mails SET status = 'claimed' WHERE id = $1 AND to_user_id = $2`, [id, req.user.uid]);
-
-    await client.query("COMMIT");
-    res.json({ status: "claimed", applied: { money_mortals: addMortals, money_cultivators: addCult } });
-  } catch (e) {
-    try { await client.query("ROLLBACK"); } catch (_) {}
-    log("error", "mail.claim.failed", { err: e?.message || String(e) });
-    res.status(500).json({ error: "Database error" });
-  } finally {
-    client.release();
-  }
-});
-
-app.post("/admin/mail/send", requireAdmin, async (req, res) => {
-  const to_user_id = Number(req.body?.to_user_id);
-  const subject = (req.body?.subject || "").toString();
-  const body = (req.body?.body || "").toString();
-  const reward_json = req.body?.reward_json ?? null;
-
-  if (!Number.isInteger(to_user_id) || to_user_id <= 0) return res.status(400).json({ error: "to_user_id must be integer" });
-  if (!subject.trim()) return res.status(400).json({ error: "subject required" });
-  if (!body.trim()) return res.status(400).json({ error: "body required" });
-
-  try {
-    const u = await getUserBasic(to_user_id);
-    if (!u) return res.status(404).json({ error: "User not found" });
-
-    const id = uuidv4();
-    await pool.query(
-      `INSERT INTO mails (id, to_user_id, from_type, from_user_id, subject, body, reward_json, status)
-       VALUES ($1, $2, 'admin', NULL, $3, $4, $5, 'unread')`,
-      [id, to_user_id, subject, body, reward_json]
-    );
-
-    res.status(201).json({ message: "sent", mail_id: id });
-  } catch (e) {
-    log("error", "admin.mail.send.failed", { err: e?.message || String(e) });
     res.status(500).json({ error: "Database error" });
   }
 });

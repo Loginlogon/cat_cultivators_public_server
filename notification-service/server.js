@@ -548,7 +548,7 @@ app.get("/notifications/summary", authenticateToken, async (req, res) => {
   }
 });
 
-// -------------------- INTERNAL: push dispatcher (called by game-mail-service) --------------------
+// -------------------- INTERNAL: push dispatcher (called by chat-service) --------------------
 app.post("/internal/push/send", requireAdmin, async (req, res) => {
   const kind = (req.body?.kind || "").toString(); // dm | mention | reaction (или любое, но фильтруем)
   const to_user_id = Number(req.body?.to_user_id);

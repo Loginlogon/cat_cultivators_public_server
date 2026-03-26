@@ -1,0 +1,35 @@
+@baseUrl = http://localhost:3005
+@adminKey = put-your-admin-key-here
+
+### Ping
+GET {{baseUrl}}/ping
+
+### Apply reward from mail
+POST {{baseUrl}}/internal/rewards/apply
+Content-Type: application/json
+x-admin-key: {{adminKey}}
+
+{
+  "user_id": 1,
+  "source_type": "mail",
+  "source_id": "00000000-0000-0000-0000-000000000001",
+  "reward": {
+    "money_mortals": 20,
+    "money_cultivators": 1
+  }
+}
+
+### Retry same reward to verify idempotency
+POST {{baseUrl}}/internal/rewards/apply
+Content-Type: application/json
+x-admin-key: {{adminKey}}
+
+{
+  "user_id": 1,
+  "source_type": "mail",
+  "source_id": "00000000-0000-0000-0000-000000000001",
+  "reward": {
+    "money_mortals": 20,
+    "money_cultivators": 1
+  }
+}

@@ -1,5 +1,5 @@
 {
-  "name": "game-mail-service",
+  "name": "chat-service",
   "version": "1.0.0",
   "main": "server.js",
   "private": true,

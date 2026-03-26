@@ -1,0 +1,8 @@
+{
+  "name": "cat-cultivators-public-server",
+  "private": true,
+  "scripts": {
+    "smoke": "node --test smoke-tests/auth.registration-mail.test.js smoke-tests/mail.claim-idempotent.test.js smoke-tests/auth.avatars-admin-guard.test.js smoke-tests/chat.global.test.js smoke-tests/chat.dm.test.js",
+    "smoke:failure": "node --test smoke-tests/auth.registration-mail.test.js smoke-tests/mail.claim-idempotent.test.js smoke-tests/auth.avatars-admin-guard.test.js smoke-tests/chat.global.test.js smoke-tests/chat.dm.test.js smoke-tests/mail.claim-failure-path.test.js"
+  }
+}

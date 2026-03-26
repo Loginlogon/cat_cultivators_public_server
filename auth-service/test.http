@@ -119,9 +119,10 @@ Authorization: Bearer {{access_token}}
 POST {{baseUrl}}/avatars/add
 Content-Type: application/json
 Accept: application/json
-Authorization: Bearer {{access_token}}
+x-admin-key: {{adminKey}}
 
 {
+  "user_id": 1,
   "avatar": "cat_01"
 }
 
